@@ -1,5 +1,7 @@
 #include "SlippiFileWriter.h"
 #include "SlippiMemory.h"
+#include "SlippiFTP.h"
+#include "SlippiSceneMonitor.h"
 #include "alloc.h"
 #include "debug.h"
 #include "string.h"
@@ -48,6 +50,10 @@ extern FATFS *devices[2];
 void SlippiFileWriterInit(bool led)
 {
 	replaysLED = led;
+
+	// Initialize FTP and scene monitoring systems
+	slippi_ftp_init();
+	slippi_scene_monitor_init();
 
 	Slippi_Thread = do_thread_create(
 		SlippiHandlerThread,
@@ -187,6 +193,11 @@ void completeFile(FIL *file, SlpGameReader *reader, u32 writtenByteCount)
 	f_lseek(file, 11);
 	FRESULT fileWriteResult = f_write(file, &writtenByteCount, 4, &wrote);
 	f_sync(file);
+	
+	// Queue replay file for FTP upload if enabled
+	// Use the same filename generation logic that was used when creating the file
+	char *fileName = generateFileName(false);
+	slippi_ftp_queue_replay(fileName);
 }
 
 static u32 SlippiHandlerThread(void *arg)
@@ -208,6 +219,9 @@ static u32 SlippiHandlerThread(void *arg)
 
 	while (1)
 	{
+		// Update scene monitor for FTP upload timing
+		slippi_scene_monitor_update();
+		
 		// Cycle time, look at const definition for more info
 		mdelay(THREAD_CYCLE_TIME_MS);
 

@@ -190,6 +190,14 @@ static const char *desc_slippi_port_a[] = {
 	NULL
 };
 
+static const char *desc_slippi_ftp[] = {
+	"When enabled, automatically",
+	"upload replay files to an FTP",
+	"server on character select",
+	"screen.",
+	NULL
+};
+
 const pageinfo slippiSettingsPage = {
 	PAGE_SLIPPI_SETTINGS,
 	"Slippi Settings",
@@ -972,6 +980,8 @@ static const char *const *GetSettingsDescription(const MenuCtx *ctx)
 			return desc_slippi_replays_led;
 		case NIN_SLIPPI_PORT_A: 
 			return desc_slippi_port_a;
+		case NIN_SLIPPI_FTP_UPLOAD:
+			return desc_slippi_ftp;
 		case NIN_SLIPPI_CUSTOM_CODES:
 			return desc_cheats;
 		default: 
@@ -1277,6 +1287,9 @@ static void Menu_Settings_InputHandler(MenuCtx *ctx)
 			case NIN_SLIPPI_PORT_A:
 				ncfg->Config ^= (NIN_CFG_SLIPPI_PORT_A);
 				break;
+			case NIN_SLIPPI_FTP_UPLOAD:
+				ncfg->Config ^= (NIN_CFG_SLIPPI_FTP);
+				break;
 			case NIN_SLIPPI_CUSTOM_CODES:
 				ncfg->Config ^= (NIN_CFG_CHEATS);
 				break;
@@ -1456,6 +1469,11 @@ static void Menu_Settings_Redraw(MenuCtx *ctx)
 		// Slippi Port A
 		PrintFormat(MENU_SIZE, BLACK, MENU_POS_X + SETTINGS_X_START, SettingY(ListLoopIndex),
 				"%-18s:%-4s", "Slippi on Port A", (ncfg->Config & (NIN_CFG_SLIPPI_PORT_A)) ? "Yes" : "No ");
+		ListLoopIndex++;
+
+		// Slippi FTP Upload
+		PrintFormat(MENU_SIZE, BLACK, MENU_POS_X + SETTINGS_X_START, SettingY(ListLoopIndex),
+				"%-18s:%-4s", "Slippi FTP Upload", (ncfg->Config & (NIN_CFG_SLIPPI_FTP)) ? "Yes" : "No ");
 		ListLoopIndex++;
 
 		// Custom Cheats

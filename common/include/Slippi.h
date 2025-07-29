@@ -29,11 +29,19 @@ struct slippi_settings {
 
 	// 32-bit, "difference between RTC and local time" in seconds.
 	// This is the number of seconds since 1/1/2000 00:00:00.
-	u32 rtc_bias;
+	unsigned int rtc_bias;
 
 	// 32-byte, user-configurable nickname for this console.
 	// This nickname will be written to replay file metadata.
 	char nickname[32];
+
+	// FTP upload settings
+	unsigned int ftp_enabled;		// 1 to enable FTP upload, 0 to disable
+	char ftp_server[64];			// FTP server hostname/IP
+	unsigned short ftp_port;		// FTP server port (typically 21)
+	char ftp_username[32];			// FTP username
+	char ftp_password[32];			// FTP password
+	char ftp_directory[64];			// Upload directory on server
 };
 
 #endif // _SLIPPI_H
