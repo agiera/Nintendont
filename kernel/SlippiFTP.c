@@ -13,10 +13,31 @@ Based on ftpii FTP implementation
 #include "debug.h"
 #include "alloc.h"
 #include "ff_utf8.h"
+#include <stdio.h>
+#include <errno.h>
 
 #define FTP_BUFFER_SIZE 1024
 #define CRLF "\r\n"
 #define CRLF_LENGTH 2
+
+// Simple implementations for missing string functions
+static char* strrchr_impl(const char* str, int c) {
+	char* last = NULL;
+	while (*str) {
+		if (*str == c) {
+			last = (char*)str;
+		}
+		str++;
+	}
+	return last;
+}
+
+static char* strcat_impl(char* dest, const char* src) {
+	char* d = dest;
+	while (*d) d++; // Find end of dest
+	while ((*d++ = *src++)); // Copy src to end of dest
+	return dest;
+}
 
 // Global state
 static slippi_ftp_queue_entry_t ftp_queue[SLIPPI_FTP_QUEUE_SIZE];
@@ -90,7 +111,7 @@ int slippi_ftp_queue_replay(const char* filepath) {
 	}
 	
 	// Extract filename from full path
-	const char* filename = strrchr(filepath, '/');
+	const char* filename = strrchr_impl(filepath, '/');
 	if (!filename) {
 		filename = filepath;
 	} else {
@@ -238,7 +259,7 @@ static int slippi_ftp_connect(slippi_ftp_client_t* client, const char* server, u
 // Send file data over socket - based on ftpii's send_from_file
 static int send_from_file(int data_socket, const char* filepath) {
 	FIL file;
-	FRESULT result = f_open(&file, filepath, FA_READ);
+	FRESULT result = f_open_char(&file, filepath, FA_READ);
 	if (result != FR_OK) {
 		dbgprintf("FTP: Failed to open file for upload: %s\r\n", filepath);
 		return -1;
@@ -444,8 +465,9 @@ static int slippi_ftp_read_response(slippi_ftp_client_t* client) {
 		s32 bytes_read = recvfrom(top_fd, client->socket, &ch, 1, 0);
 		
 		if (bytes_read <= 0) {
-			if (bytes_read == -EAGAIN) {
-				continue; // Try again
+			if (bytes_read < 0) {
+				// Network error - could be temporary, try again  
+				continue;
 			}
 			dbgprintf("FTP: Failed to read response\r\n");
 			return SLIPPI_FTP_ERROR;
@@ -513,11 +535,8 @@ static int transfer_exact(int socket, char *buf, int length, int is_send) {
 			remaining -= bytes_transferred;
 			buf += bytes_transferred;
 		} else if (bytes_transferred < 0) {
-			if (bytes_transferred == -EAGAIN) {
-				continue; // Try again
-			}
-			result = bytes_transferred;
-			break;
+			// Network error - could be temporary, try again  
+			continue;
 		} else {
 			result = -1; // Connection closed
 			break;
@@ -541,7 +560,7 @@ static int slippi_ftp_send_command(slippi_ftp_client_t* client, const char* comm
 	}
 	
 	strcpy(cmd_buffer, command);
-	strcat(cmd_buffer, CRLF);
+	strcat_impl(cmd_buffer, CRLF);
 	
 	// Send command using transfer_exact approach from ftpii
 	int total_len = cmd_len + CRLF_LENGTH;
