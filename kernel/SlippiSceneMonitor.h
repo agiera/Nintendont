@@ -30,6 +30,5 @@ void slippi_scene_monitor_cleanup(void);
 int slippi_scene_is_character_select(void);
 int slippi_scene_is_stage_select(void);
 unsigned char slippi_scene_get_current(void);
-static void slippi_scene_handle_transition(void);
 
 #endif /* _SLIPPI_SCENE_MONITOR_H_ */

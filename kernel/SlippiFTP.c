@@ -13,8 +13,6 @@ Based on ftpii FTP implementation
 #include "debug.h"
 #include "alloc.h"
 #include "ff_utf8.h"
-#include <stdio.h>
-#include <errno.h>
 
 #define FTP_BUFFER_SIZE 1024
 #define CRLF "\r\n"
@@ -102,11 +100,16 @@ void slippi_ftp_cleanup(void) {
 
 // Add a replay file to the upload queue
 int slippi_ftp_queue_replay(const char* filepath) {
-	if (!ftp_initialized) {
-		slippi_ftp_init();
+	if (!filepath) {
+		return SLIPPI_FTP_ERROR;
 	}
 	
-	if (!filepath || queue_count >= SLIPPI_FTP_QUEUE_SIZE) {
+	if (!ftp_initialized) {
+		// If FTP is not initialized (disabled), just return success to avoid errors
+		return SLIPPI_FTP_SUCCESS;
+	}
+	
+	if (queue_count >= SLIPPI_FTP_QUEUE_SIZE) {
 		return SLIPPI_FTP_ERROR;
 	}
 	
@@ -189,6 +192,10 @@ int slippi_ftp_upload_queued_replays(void) {
 
 // Cancel any uploads in progress
 void slippi_ftp_cancel_uploads(void) {
+	if (!ftp_initialized) {
+		return;
+	}
+	
 	if (upload_in_progress) {
 		slippi_ftp_disconnect(&ftp_client);
 		upload_in_progress = 0;
@@ -222,18 +229,41 @@ static int slippi_ftp_connect(slippi_ftp_client_t* client, const char* server, u
 	server_addr.sin_family = AF_INET;
 	server_addr.sin_port = port;
 	
-	// Parse IP address - ftpii uses inet_aton but we'll do manual parsing
+	// Parse IP address manually
 	u32 ip_addr = 0;
-	int h1, h2, h3, h4;
-	if (sscanf(server, "%d.%d.%d.%d", &h1, &h2, &h3, &h4) == 4) {
-		ip_addr = (h1 << 24) | (h2 << 16) | (h3 << 8) | h4;
-		memcpy(&server_addr.sin_addr, &ip_addr, sizeof(ip_addr));
-	} else {
-		dbgprintf("FTP: Invalid IP address format\r\n");
-		close(top_fd, client->socket);
-		client->socket = -1;
-		return SLIPPI_FTP_CONNECT_FAIL;
-	}
+	int h1 = 0, h2 = 0, h3 = 0, h4 = 0;
+	const char* p = server;
+	
+	// Parse first octet
+	while (*p >= '0' && *p <= '9') h1 = h1 * 10 + (*p++ - '0');
+	if (*p++ != '.') goto ip_error;
+	
+	// Parse second octet
+	while (*p >= '0' && *p <= '9') h2 = h2 * 10 + (*p++ - '0');
+	if (*p++ != '.') goto ip_error;
+	
+	// Parse third octet
+	while (*p >= '0' && *p <= '9') h3 = h3 * 10 + (*p++ - '0');
+	if (*p++ != '.') goto ip_error;
+	
+	// Parse fourth octet
+	while (*p >= '0' && *p <= '9') h4 = h4 * 10 + (*p++ - '0');
+	if (*p != '\0') goto ip_error;
+	
+	// Validate ranges
+	if (h1 > 255 || h2 > 255 || h3 > 255 || h4 > 255) goto ip_error;
+	
+	ip_addr = (h1 << 24) | (h2 << 16) | (h3 << 8) | h4;
+	memcpy(&server_addr.sin_addr, &ip_addr, sizeof(ip_addr));
+	goto ip_success;
+	
+ip_error:
+	dbgprintf("FTP: Invalid IP address format\r\n");
+	close(top_fd, client->socket);
+	client->socket = -1;
+	return SLIPPI_FTP_CONNECT_FAIL;
+	
+ip_success:
 	
 	// Connect to server
 	if (connect(top_fd, client->socket, (struct sockaddr*)&server_addr) < 0) {
@@ -375,11 +405,43 @@ static int slippi_ftp_upload_file(slippi_ftp_client_t* client, const char* local
 		return SLIPPI_FTP_UPLOAD_FAIL;
 	}
 	
-	int h1, h2, h3, h4, p1, p2;
-	if (sscanf(pasv_start + 1, "%d,%d,%d,%d,%d,%d", &h1, &h2, &h3, &h4, &p1, &p2) != 6) {
-		dbgprintf("FTP: Failed to parse PASV response\r\n");
-		return SLIPPI_FTP_UPLOAD_FAIL;
-	}
+	// Parse PASV values manually
+	int h1 = 0, h2 = 0, h3 = 0, h4 = 0, p1 = 0, p2 = 0;
+	const char* p = pasv_start + 1;
+	
+	// Parse h1
+	while (*p >= '0' && *p <= '9') h1 = h1 * 10 + (*p++ - '0');
+	if (*p++ != ',') goto pasv_error;
+	
+	// Parse h2
+	while (*p >= '0' && *p <= '9') h2 = h2 * 10 + (*p++ - '0');
+	if (*p++ != ',') goto pasv_error;
+	
+	// Parse h3
+	while (*p >= '0' && *p <= '9') h3 = h3 * 10 + (*p++ - '0');
+	if (*p++ != ',') goto pasv_error;
+	
+	// Parse h4
+	while (*p >= '0' && *p <= '9') h4 = h4 * 10 + (*p++ - '0');
+	if (*p++ != ',') goto pasv_error;
+	
+	// Parse p1
+	while (*p >= '0' && *p <= '9') p1 = p1 * 10 + (*p++ - '0');
+	if (*p++ != ',') goto pasv_error;
+	
+	// Parse p2
+	while (*p >= '0' && *p <= '9') p2 = p2 * 10 + (*p++ - '0');
+	if (*p != ')') goto pasv_error;
+	
+	// Validate ranges
+	if (h1 > 255 || h2 > 255 || h3 > 255 || h4 > 255 || p1 > 255 || p2 > 255) goto pasv_error;
+	goto pasv_success;
+	
+pasv_error:
+	dbgprintf("FTP: Failed to parse PASV response\r\n");
+	return SLIPPI_FTP_UPLOAD_FAIL;
+	
+pasv_success:
 	
 	// Create data connection socket
 	s32 data_socket = socket(top_fd, AF_INET, SOCK_STREAM, IPPROTO_TCP);
