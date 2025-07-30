@@ -7,6 +7,7 @@
 #include "string.h"
 #include "ff_utf8.h"
 #include "net.h"
+#include "common.h"
 
 #include "Config.h"
 #include "usbstorage.h"
@@ -51,20 +52,36 @@ void SlippiFileWriterInit(bool led)
 {
 	replaysLED = led;
 
-	// Initialize FTP system only if enabled
-	// TEMPORARILY DISABLED - FTP code removed from build
-	if (slippi_settings && slippi_settings->ftp_enabled) {
-		slippi_ftp_init();
-	// Initialize scene monitoring system only when FTP is enabled
-		slippi_scene_monitor_init();
+	// Only initialize FTP system if both network and FTP are enabled
+	if (slippi_settings && slippi_settings->ftp_enabled && ConfigGetConfig(NIN_CFG_NETWORK)) {
+		dbgprintf("SlippiFileWriter: Initializing FTP system\r\n");
+		if (slippi_ftp_init() == SLIPPI_FTP_SUCCESS) {
+			dbgprintf("SlippiFileWriter: FTP init successful\r\n");
+			// Initialize scene monitoring system only when FTP is enabled
+			slippi_scene_monitor_init();
+			dbgprintf("SlippiFileWriter: Scene monitor init successful\r\n");
+		} else {
+			dbgprintf("SlippiFileWriter: FTP init failed\r\n");
+		}
+	} else {
+		if (!slippi_settings) {
+			dbgprintf("SlippiFileWriter: No slippi_settings available\r\n");
+		} else if (!slippi_settings->ftp_enabled) {
+			dbgprintf("SlippiFileWriter: FTP disabled in settings\r\n");
+		} else if (!ConfigGetConfig(NIN_CFG_NETWORK)) {
+			dbgprintf("SlippiFileWriter: Network not enabled, skipping FTP init\r\n");
+		}
 	}
 
+	dbgprintf("SlippiFileWriter: About to create Slippi thread...\r\n");
 	Slippi_Thread = do_thread_create(
 		SlippiHandlerThread,
 		((u32 *)&__slippi_stack_addr),
 		((u32)(&__slippi_stack_size)),
 		0x78);
+	dbgprintf("SlippiFileWriter: Thread created with ID %d\r\n", Slippi_Thread);
 	thread_continue(Slippi_Thread);
+	dbgprintf("SlippiFileWriter: Thread started, init complete\r\n");
 }
 
 void SlippiFileWriterUpdateRegisters()
@@ -195,15 +212,8 @@ void completeFile(FIL *file, SlpGameReader *reader, u32 writtenByteCount)
 	f_sync(file);
 
 	f_lseek(file, 11);
-	f_write(file, &writtenByteCount, 4, &wrote);
+	FRESULT fileWriteResult = f_write(file, &writtenByteCount, 4, &wrote);
 	f_sync(file);
-	
-	// Queue replay file for FTP upload if enabled
-	if (slippi_settings && slippi_settings->ftp_enabled) {
-		// Use the same filename generation logic that was used when creating the file
-		char *fileName = generateFileName(false);
-		slippi_ftp_queue_replay(fileName);
-	}
 }
 
 static u32 SlippiHandlerThread(void *arg)
@@ -225,11 +235,6 @@ static u32 SlippiHandlerThread(void *arg)
 
 	while (1)
 	{
-		// Update scene monitor for FTP upload timing (only if FTP is enabled)
-		if (slippi_settings && slippi_settings->ftp_enabled) {
-			slippi_scene_monitor_update();
-		}
-		
 		// Cycle time, look at const definition for more info
 		mdelay(THREAD_CYCLE_TIME_MS);
 
@@ -334,12 +339,69 @@ static u32 SlippiHandlerThread(void *arg)
 		memReadPos += wrote;
 		writtenByteCount += wrote;
 
-		if (reader.lastReadResult.isGameEnd)
+		if (reader.lastReadResult.isGameEnd) 
 		{
-			dbgprintf("Completing File...\r\n");
-			completeFile(&currentFile, &reader, writtenByteCount);
-			f_close(&currentFile);
-			hasFile = false;
+			dbgprintf("SlippiHandlerThread: Game end detected!\r\n");
+			if (writtenByteCount > 0) {
+				dbgprintf("SlippiHandlerThread: Completing file with %d bytes written\r\n", writtenByteCount);
+				completeFile(&currentFile, &reader, writtenByteCount);
+				
+				// Ensure file is fully synced before closing
+				f_sync(&currentFile);
+				dbgprintf("SlippiHandlerThread: File synced, about to close\r\n");
+				
+				FRESULT closeResult = f_close(&currentFile);
+				hasFile = false;
+				dbgprintf("SlippiHandlerThread: File close result: %d\r\n", closeResult);
+				
+				// Verify file accessibility before FTP upload
+				// Wait and then attempt to open file in read mode to ensure it's released
+				dbgprintf("SlippiHandlerThread: Starting file verification process\r\n");
+				char *fileName = generateFileName(false);
+				dbgprintf("SlippiHandlerThread: Verifying file: %s\r\n", fileName);
+				FIL testFile;
+				int attempts = 0;
+				FRESULT testResult = FR_DENIED;
+				
+				while (attempts < 10 && testResult != FR_OK) {
+					mdelay(1000);
+					testResult = f_open_secondary_drive(&testFile, fileName, FA_READ);
+					if (testResult == FR_OK) {
+						f_close(&testFile);
+						dbgprintf("SlippiHandlerThread: File verification successful after %d attempts\r\n", attempts + 1);
+						break;
+					} else {
+						dbgprintf("SlippiHandlerThread: File verification attempt %d failed (%d)\r\n", attempts + 1, testResult);
+					}
+					attempts++;
+				}
+				
+				writtenByteCount = 0;
+				
+				// Queue replay file for FTP upload if enabled (AFTER file is verified accessible)
+				if (slippi_settings && slippi_settings->ftp_enabled && testResult == FR_OK) {
+					dbgprintf("SlippiFileWriter: FTP enabled and file verified, queueing replay for upload\r\n");
+					dbgprintf("SlippiFileWriter: Queueing file: %s\r\n", fileName);
+					int ftpResult = slippi_ftp_queue_replay(fileName);
+					dbgprintf("SlippiFileWriter: FTP queue result: %d\r\n", ftpResult);
+					
+					// Also check current queue status
+					int queueCount = slippi_ftp_get_queue_count();
+					dbgprintf("SlippiFileWriter: Current FTP queue count: %d\r\n", queueCount);
+					
+					// Try to upload immediately after completing a file
+					dbgprintf("SlippiFileWriter: Attempting immediate FTP upload\r\n");
+					int uploadResult = slippi_ftp_upload_queued_replays();
+					dbgprintf("SlippiFileWriter: Immediate FTP upload result: %d\r\n", uploadResult);
+				} else if (slippi_settings && slippi_settings->ftp_enabled) {
+					dbgprintf("SlippiFileWriter: FTP enabled but file verification failed, skipping upload\r\n");
+				}
+				
+				// Flash LED to indicate completion
+				if (replaysLED) {
+					flashLED();
+				}
+			}
 		}
 	}
 
