@@ -46,6 +46,10 @@ static slippi_ftp_client_t ftp_client;
 static int ftp_initialized = 0;
 static int upload_in_progress = 0;
 
+// Streaming upload state
+static slippi_ftp_stream_t stream_upload;
+static slippi_ftp_client_t stream_client;
+
 // Function prototypes for internal functions
 static int slippi_ftp_connect(slippi_ftp_client_t* client, const char* server, unsigned short port);
 static int slippi_ftp_authenticate(slippi_ftp_client_t* client, const char* username, const char* password);
@@ -79,6 +83,12 @@ int slippi_ftp_init(void) {
 	ftp_client.connected = 0;
 	ftp_client.authenticated = 0;
 	
+	// Clear streaming state
+	memset(&stream_upload, 0, sizeof(stream_upload));
+	stream_upload.data_socket = -1;
+	memset(&stream_client, 0, sizeof(stream_client));
+	stream_client.socket = -1;
+	
 	upload_in_progress = 0;
 	ftp_initialized = 1;
 	
@@ -91,6 +101,9 @@ void slippi_ftp_cleanup(void) {
 	if (!ftp_initialized) {
 		return;
 	}
+	
+	// Cancel any active streaming upload
+	slippi_ftp_cancel_stream_upload();
 	
 	slippi_ftp_disconnect(&ftp_client);
 	
@@ -849,4 +862,226 @@ static void slippi_ftp_clear_responses(slippi_ftp_client_t* client) {
 		}
 		dbgprintf("FTP: Cleared %d pending bytes\r\n", bytes_read);
 	}
+}
+
+// Streaming upload functions
+
+// Start a streaming upload
+int slippi_ftp_start_stream_upload(const char* local_path, const char* remote_path) {
+	extern s32 top_fd;
+	
+	if (!ftp_initialized || !slippi_settings || !slippi_settings->ftp_enabled) {
+		dbgprintf("FTP Stream: Not initialized or FTP disabled\r\n");
+		return SLIPPI_FTP_ERROR;
+	}
+	
+	if (stream_upload.active) {
+		dbgprintf("FTP Stream: Upload already active\r\n");
+		return SLIPPI_FTP_ERROR;
+	}
+	
+	// Check network status
+	if (top_fd < 0) {
+		dbgprintf("FTP Stream: Network not available\r\n");
+		return SLIPPI_FTP_CONNECT_FAIL;
+	}
+	
+	dbgprintf("FTP Stream: Starting upload for %s -> %s\r\n", local_path, remote_path);
+	
+	// Connect to FTP server
+	if (slippi_ftp_connect(&stream_client, slippi_settings->ftp_server, slippi_settings->ftp_port) != SLIPPI_FTP_SUCCESS) {
+		dbgprintf("FTP Stream: Connection failed\r\n");
+		return SLIPPI_FTP_CONNECT_FAIL;
+	}
+	
+	// Authenticate
+	if (slippi_ftp_authenticate(&stream_client, slippi_settings->ftp_username, slippi_settings->ftp_password) != SLIPPI_FTP_SUCCESS) {
+		slippi_ftp_disconnect(&stream_client);
+		return SLIPPI_FTP_AUTH_FAIL;
+	}
+	
+	// Set binary mode
+	if (slippi_ftp_send_command(&stream_client, "TYPE I") != SLIPPI_FTP_SUCCESS) {
+		slippi_ftp_disconnect(&stream_client);
+		return SLIPPI_FTP_UPLOAD_FAIL;
+	}
+	
+	int response_code = slippi_ftp_read_response(&stream_client);
+	if (response_code != 200) {
+		slippi_ftp_disconnect(&stream_client);
+		return SLIPPI_FTP_UPLOAD_FAIL;
+	}
+	
+	// Enter passive mode
+	if (slippi_ftp_send_command(&stream_client, "PASV") != SLIPPI_FTP_SUCCESS) {
+		slippi_ftp_disconnect(&stream_client);
+		return SLIPPI_FTP_UPLOAD_FAIL;
+	}
+	
+	response_code = slippi_ftp_read_response(&stream_client);
+	if (response_code != 227) {
+		slippi_ftp_disconnect(&stream_client);
+		return SLIPPI_FTP_UPLOAD_FAIL;
+	}
+	
+	// Parse PASV response
+	char* pasv_start = strstr(stream_client.response_buffer, "(");
+	if (!pasv_start) {
+		slippi_ftp_disconnect(&stream_client);
+		return SLIPPI_FTP_UPLOAD_FAIL;
+	}
+	
+	int h1 = 0, h2 = 0, h3 = 0, h4 = 0, p1 = 0, p2 = 0;
+	const char* p = pasv_start + 1;
+	
+	// Parse PASV values
+	while (*p >= '0' && *p <= '9') h1 = h1 * 10 + (*p++ - '0');
+	if (*p++ != ',') goto stream_pasv_error;
+	while (*p >= '0' && *p <= '9') h2 = h2 * 10 + (*p++ - '0');
+	if (*p++ != ',') goto stream_pasv_error;
+	while (*p >= '0' && *p <= '9') h3 = h3 * 10 + (*p++ - '0');
+	if (*p++ != ',') goto stream_pasv_error;
+	while (*p >= '0' && *p <= '9') h4 = h4 * 10 + (*p++ - '0');
+	if (*p++ != ',') goto stream_pasv_error;
+	while (*p >= '0' && *p <= '9') p1 = p1 * 10 + (*p++ - '0');
+	if (*p++ != ',') goto stream_pasv_error;
+	while (*p >= '0' && *p <= '9') p2 = p2 * 10 + (*p++ - '0');
+	if (*p != ')') goto stream_pasv_error;
+	
+	if (h1 > 255 || h2 > 255 || h3 > 255 || h4 > 255 || p1 > 255 || p2 > 255) goto stream_pasv_error;
+	
+	goto stream_pasv_success;
+	
+stream_pasv_error:
+	slippi_ftp_disconnect(&stream_client);
+	return SLIPPI_FTP_UPLOAD_FAIL;
+	
+stream_pasv_success:
+	
+	// Create data connection
+	stream_upload.data_socket = socket(top_fd, AF_INET, SOCK_STREAM, IPPROTO_IP);
+	if (stream_upload.data_socket < 0) {
+		slippi_ftp_disconnect(&stream_client);
+		return SLIPPI_FTP_UPLOAD_FAIL;
+	}
+	
+	// Connect to data port
+	struct sockaddr_in data_addr;
+	memset(&data_addr, 0, sizeof(data_addr));
+	data_addr.sin_len = 8;
+	data_addr.sin_family = AF_INET;
+	data_addr.sin_port = (p1 << 8) | p2;
+	
+	u32 data_ip = (h1 << 24) | (h2 << 16) | (h3 << 8) | h4;
+	memcpy(&data_addr.sin_addr, &data_ip, sizeof(data_ip));
+	
+	if (connect(top_fd, stream_upload.data_socket, (struct sockaddr*)&data_addr) < 0) {
+		close(top_fd, stream_upload.data_socket);
+		stream_upload.data_socket = -1;
+		slippi_ftp_disconnect(&stream_client);
+		return SLIPPI_FTP_UPLOAD_FAIL;
+	}
+	
+	// Send STOR command
+	char stor_cmd[256];
+	_sprintf(stor_cmd, "STOR %s", remote_path);
+	
+	if (slippi_ftp_send_command(&stream_client, stor_cmd) != SLIPPI_FTP_SUCCESS) {
+		close(top_fd, stream_upload.data_socket);
+		stream_upload.data_socket = -1;
+		slippi_ftp_disconnect(&stream_client);
+		return SLIPPI_FTP_UPLOAD_FAIL;
+	}
+	
+	// Read initial response
+	response_code = slippi_ftp_read_response(&stream_client);
+	if (response_code != 150) {
+		close(top_fd, stream_upload.data_socket);
+		stream_upload.data_socket = -1;
+		slippi_ftp_disconnect(&stream_client);
+		return SLIPPI_FTP_UPLOAD_FAIL;
+	}
+	
+	// Initialize stream state
+	stream_upload.active = 1;
+	stream_upload.bytes_uploaded = 0;
+	stream_upload.client = &stream_client;
+	strncpy(stream_upload.remote_filename, remote_path, sizeof(stream_upload.remote_filename) - 1);
+	strncpy(stream_upload.local_filepath, local_path, sizeof(stream_upload.local_filepath) - 1);
+	
+	dbgprintf("FTP Stream: Upload started successfully\r\n");
+	return SLIPPI_FTP_SUCCESS;
+}
+
+// Stream data to the FTP server
+int slippi_ftp_stream_data(const void* data, u32 size) {
+	if (!stream_upload.active || stream_upload.data_socket < 0 || !data || size == 0) {
+		return SLIPPI_FTP_ERROR;
+	}
+	
+	int result = transfer_exact(stream_upload.data_socket, (char*)data, size, 1);
+	if (result < 0) {
+		dbgprintf("FTP Stream: Failed to send data chunk (%d bytes)\r\n", size);
+		return SLIPPI_FTP_UPLOAD_FAIL;
+	}
+	
+	stream_upload.bytes_uploaded += size;
+	return SLIPPI_FTP_SUCCESS;
+}
+
+// Finish the streaming upload
+int slippi_ftp_finish_stream_upload(void) {
+	extern s32 top_fd;
+	
+	if (!stream_upload.active) {
+		return SLIPPI_FTP_ERROR;
+	}
+	
+	dbgprintf("FTP Stream: Finishing upload (%d bytes uploaded)\r\n", stream_upload.bytes_uploaded);
+	
+	// Close data connection
+	if (stream_upload.data_socket >= 0) {
+		close(top_fd, stream_upload.data_socket);
+		stream_upload.data_socket = -1;
+	}
+	
+	// Read final response
+	int response_code = slippi_ftp_read_response(&stream_client);
+	if (response_code != 226) {
+		dbgprintf("FTP Stream: Transfer completion failed with code %d\r\n", response_code);
+		slippi_ftp_disconnect(&stream_client);
+		stream_upload.active = 0;
+		return SLIPPI_FTP_UPLOAD_FAIL;
+	}
+	
+	// Disconnect from FTP server
+	slippi_ftp_disconnect(&stream_client);
+	stream_upload.active = 0;
+	
+	dbgprintf("FTP Stream: Upload completed successfully\r\n");
+	return SLIPPI_FTP_SUCCESS;
+}
+
+// Cancel the streaming upload
+void slippi_ftp_cancel_stream_upload(void) {
+	extern s32 top_fd;
+	
+	if (!stream_upload.active) {
+		return;
+	}
+	
+	dbgprintf("FTP Stream: Cancelling active upload\r\n");
+	
+	if (stream_upload.data_socket >= 0) {
+		close(top_fd, stream_upload.data_socket);
+		stream_upload.data_socket = -1;
+	}
+	
+	slippi_ftp_disconnect(&stream_client);
+	stream_upload.active = 0;
+}
+
+// Check if streaming upload is active
+int slippi_ftp_is_stream_active(void) {
+	return stream_upload.active;
 }

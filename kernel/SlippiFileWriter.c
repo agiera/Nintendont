@@ -12,6 +12,9 @@
 #include "Config.h"
 #include "usbstorage.h"
 
+// strrchr is used to extract filename from full path but is not available in embedded string.h
+extern char *strrchr(const char *s, int c);
+
 // Game can transfer at most 784 bytes / frame
 // That means 4704 bytes every 100 ms. Let's aim to handle
 // double that, making our read buffer 10000 bytes
@@ -95,6 +98,12 @@ void SlippiFileWriterUpdateRegisters()
 
 void SlippiFileWriterShutdown()
 {
+	// Cancel any active FTP streaming upload
+	if (slippi_ftp_is_stream_active()) {
+		dbgprintf("SlippiFileWriter: Cancelling active FTP stream upload\r\n");
+		slippi_ftp_cancel_stream_upload();
+	}
+	
 	thread_cancel(Slippi_Thread, 0);
 }
 
@@ -212,7 +221,7 @@ void completeFile(FIL *file, SlpGameReader *reader, u32 writtenByteCount)
 	f_sync(file);
 
 	f_lseek(file, 11);
-	FRESULT fileWriteResult = f_write(file, &writtenByteCount, 4, &wrote);
+	f_write(file, &writtenByteCount, 4, &wrote);
 	f_sync(file);
 }
 
@@ -245,6 +254,12 @@ static u32 SlippiHandlerThread(void *arg)
 				if (mounted)
 					f_mount_char(NULL, "usb:", 1);
 
+				// Cancel any active FTP streaming upload when USB is removed
+				if (slippi_ftp_is_stream_active()) {
+					dbgprintf("SlippiFileWriter: USB removed, cancelling FTP stream upload\r\n");
+					slippi_ftp_cancel_stream_upload();
+				}
+
 				failedToMount = false;
 				hasFile = false;
 				mounted = false;
@@ -276,6 +291,12 @@ static u32 SlippiHandlerThread(void *arg)
 		{
 			if (err == SLP_READ_OVERFLOW)
 				memReadPos = SlippiRestoreReadPos();
+			
+			// Cancel any active FTP streaming upload on error
+			if (slippi_ftp_is_stream_active()) {
+				dbgprintf("SlippiFileWriter: Memory read error, cancelling FTP stream upload\r\n");
+				slippi_ftp_cancel_stream_upload();
+			}
 				
 			mdelay(LED_FLASH_TIME_MS + 1000); // we always want LED visibly off if this happens
 			
@@ -305,6 +326,37 @@ static u32 SlippiHandlerThread(void *arg)
 			hasFile = true;
 			writtenByteCount = 0;
 			writeHeader(&currentFile);
+			
+			// Start streaming FTP upload if enabled
+			if (slippi_settings && slippi_settings->ftp_enabled && ConfigGetConfig(NIN_CFG_NETWORK)) {
+				// Construct remote path
+				char remote_path[256];
+				const char* filename_only = strrchr(fileName, '/');
+				if (!filename_only) {
+					filename_only = fileName;
+				} else {
+					filename_only++; // Skip the '/'
+				}
+				
+				if (strlen(slippi_settings->ftp_directory) > 0 && strcmp(slippi_settings->ftp_directory, "/") != 0) {
+					_sprintf(remote_path, "%s/%s", slippi_settings->ftp_directory, filename_only);
+				} else {
+					strncpy(remote_path, filename_only, sizeof(remote_path) - 1);
+					remote_path[sizeof(remote_path) - 1] = '\0';
+				}
+				
+				dbgprintf("SlippiFileWriter: Starting FTP stream upload to %s\r\n", remote_path);
+				int stream_result = slippi_ftp_start_stream_upload(fileName, remote_path);
+				if (stream_result == SLIPPI_FTP_SUCCESS) {
+					dbgprintf("SlippiFileWriter: FTP stream upload started successfully\r\n");
+					
+					// Stream the header that was just written
+					u8 header[] = {'{', 'U', 3, 'r', 'a', 'w', '[', '$', 'U', '#', 'l', 0, 0, 0, 0};
+					slippi_ftp_stream_data(header, sizeof(header));
+				} else {
+					dbgprintf("SlippiFileWriter: Failed to start FTP stream upload (%d)\r\n", stream_result);
+				}
+			}
 		}
 
 		if (reader.lastReadResult.bytesRead == 0)
@@ -335,6 +387,15 @@ static u32 SlippiHandlerThread(void *arg)
 		if (wrote == 0)
 			continue;
 
+		// Stream data to FTP if upload is active
+		if (slippi_ftp_is_stream_active() && wrote > 0) {
+			int stream_result = slippi_ftp_stream_data(readBuf, wrote);
+			if (stream_result != SLIPPI_FTP_SUCCESS) {
+				dbgprintf("SlippiFileWriter: FTP stream data failed, cancelling upload\r\n");
+				slippi_ftp_cancel_stream_upload();
+			}
+		}
+
 		// Only increment mem read position when the data is correctly written
 		memReadPos += wrote;
 		writtenByteCount += wrote;
@@ -344,6 +405,74 @@ static u32 SlippiHandlerThread(void *arg)
 			dbgprintf("SlippiHandlerThread: Game end detected!\r\n");
 			if (writtenByteCount > 0) {
 				dbgprintf("SlippiHandlerThread: Completing file with %d bytes written\r\n", writtenByteCount);
+				
+				// Complete the file footer
+				u8 footer[FOOTER_BUFFER_LENGTH];
+				u32 writePos = 0;
+
+				// Write opener
+				u8 footerOpener[] = {'U', 8, 'm', 'e', 't', 'a', 'd', 'a', 't', 'a', '{'};
+				u8 writeLen = sizeof(footerOpener);
+				memcpy(&footer[writePos], footerOpener, writeLen);
+				writePos += writeLen;
+
+				// Write startAt
+				char timeStr[] = "2011-10-08T07:07:09";
+				int timeStrLen = strlen(timeStr);
+				struct tm *tmp = gmtime(&gameStartTime);
+				_sprintf(
+					&timeStr[0], "%04d-%02d-%02dT%02d:%02d:%02d", tmp->tm_year + 1900,
+					tmp->tm_mon + 1, tmp->tm_mday, tmp->tm_hour, tmp->tm_min, tmp->tm_sec);
+				u8 startAtOpener[] = {'U', 7, 's', 't', 'a', 'r', 't', 'A', 't', 'S', 'U', (u8)timeStrLen};
+				writeLen = sizeof(startAtOpener);
+				memcpy(&footer[writePos], startAtOpener, writeLen);
+				writePos += writeLen;
+				writeLen = timeStrLen;
+				memcpy(&footer[writePos], timeStr, writeLen);
+				writePos += writeLen;
+
+				// Write lastFrame
+				u8 lastFrameOpener[] = {'U', 9, 'l', 'a', 's', 't', 'F', 'r', 'a', 'm', 'e', 'l'};
+				writeLen = sizeof(lastFrameOpener);
+				memcpy(&footer[writePos], lastFrameOpener, writeLen);
+				writePos += writeLen;
+				memcpy(&footer[writePos], &reader.metadata.lastFrame, 4);
+				writePos += 4;
+
+				// Write console nickname
+				u8 nickLen = strlen(SlippiGetConsoleNick());
+				if (nickLen > 32) nickLen = 32;
+				u8 consoleNickOpener[] = { 'U', 11, 'c', 'o', 'n', 's', 'o', 'l', 'e', 'N', 'i', 'c', 'k', 'S', 'U', nickLen };
+				writeLen = sizeof(consoleNickOpener);
+				memcpy(&footer[writePos], consoleNickOpener, writeLen);
+				writePos += writeLen;
+				memcpy(&footer[writePos], SlippiGetConsoleNick(), nickLen);
+				writePos += nickLen;
+
+				// Write closing
+				u8 closing[] = {
+					'U', 7, 'p', 'l', 'a', 'y', 'e', 'r', 's', '{', '}',
+					'U', 8, 'p', 'l', 'a', 'y', 'e', 'd', 'O', 'n', 'S', 'U',
+					10, 'n', 'i', 'n', 't', 'e', 'n', 'd', 'o', 'n', 't',
+					'}', '}'};
+				writeLen = sizeof(closing);
+				memcpy(&footer[writePos], closing, writeLen);
+				writePos += writeLen;
+
+				// Stream footer to FTP if upload is active
+				if (slippi_ftp_is_stream_active()) {
+					dbgprintf("SlippiFileWriter: Streaming footer to FTP (%d bytes)\r\n", writePos);
+					slippi_ftp_stream_data(footer, writePos);
+					
+					// Finish the streaming upload
+					int stream_result = slippi_ftp_finish_stream_upload();
+					if (stream_result == SLIPPI_FTP_SUCCESS) {
+						dbgprintf("SlippiFileWriter: FTP stream upload completed successfully\r\n");
+					} else {
+						dbgprintf("SlippiFileWriter: FTP stream upload failed to complete (%d)\r\n", stream_result);
+					}
+				}
+				
 				completeFile(&currentFile, &reader, writtenByteCount);
 				
 				// Ensure file is fully synced before closing
@@ -354,48 +483,21 @@ static u32 SlippiHandlerThread(void *arg)
 				hasFile = false;
 				dbgprintf("SlippiHandlerThread: File close result: %d\r\n", closeResult);
 				
-				// Verify file accessibility before FTP upload
-				// Wait and then attempt to open file in read mode to ensure it's released
+				// Since we're already uploading via streaming, we don't need the post-completion upload
+				// Just verify file accessibility for potential future use
 				dbgprintf("SlippiHandlerThread: Starting file verification process\r\n");
 				char *fileName = generateFileName(false);
 				dbgprintf("SlippiHandlerThread: Verifying file: %s\r\n", fileName);
 				FIL testFile;
-				int attempts = 0;
-				FRESULT testResult = FR_DENIED;
-				
-				while (attempts < 10 && testResult != FR_OK) {
-					mdelay(1000);
-					testResult = f_open_secondary_drive(&testFile, fileName, FA_READ);
-					if (testResult == FR_OK) {
-						f_close(&testFile);
-						dbgprintf("SlippiHandlerThread: File verification successful after %d attempts\r\n", attempts + 1);
-						break;
-					} else {
-						dbgprintf("SlippiHandlerThread: File verification attempt %d failed (%d)\r\n", attempts + 1, testResult);
-					}
-					attempts++;
+				FRESULT testResult = f_open_secondary_drive(&testFile, fileName, FA_READ);
+				if (testResult == FR_OK) {
+					f_close(&testFile);
+					dbgprintf("SlippiHandlerThread: File verification successful\r\n");
+				} else {
+					dbgprintf("SlippiHandlerThread: File verification failed (%d)\r\n", testResult);
 				}
 				
 				writtenByteCount = 0;
-				
-				// Queue replay file for FTP upload if enabled (AFTER file is verified accessible)
-				if (slippi_settings && slippi_settings->ftp_enabled && testResult == FR_OK) {
-					dbgprintf("SlippiFileWriter: FTP enabled and file verified, queueing replay for upload\r\n");
-					dbgprintf("SlippiFileWriter: Queueing file: %s\r\n", fileName);
-					int ftpResult = slippi_ftp_queue_replay(fileName);
-					dbgprintf("SlippiFileWriter: FTP queue result: %d\r\n", ftpResult);
-					
-					// Also check current queue status
-					int queueCount = slippi_ftp_get_queue_count();
-					dbgprintf("SlippiFileWriter: Current FTP queue count: %d\r\n", queueCount);
-					
-					// Try to upload immediately after completing a file
-					dbgprintf("SlippiFileWriter: Attempting immediate FTP upload\r\n");
-					int uploadResult = slippi_ftp_upload_queued_replays();
-					dbgprintf("SlippiFileWriter: Immediate FTP upload result: %d\r\n", uploadResult);
-				} else if (slippi_settings && slippi_settings->ftp_enabled) {
-					dbgprintf("SlippiFileWriter: FTP enabled but file verification failed, skipping upload\r\n");
-				}
 				
 				// Flash LED to indicate completion
 				if (replaysLED) {
