@@ -368,18 +368,61 @@ bool LoadSlippiDat(void)
 	UINT BytesRead;
 	FIL dat;
 
+	// Initialize with safe defaults
 	memset(slippi_settings, 0, sizeof(struct slippi_settings));
+	
+	// Set safe FTP defaults
+	slippi_settings->ftp_enabled = 0;  // Disabled by default
+	slippi_settings->ftp_port = 21;    // Standard FTP port
+	strcpy(slippi_settings->ftp_directory, "/");  // Root directory
 
-	if (f_open_char(&dat, SLIPPI_DAT_FILE, FA_READ|FA_OPEN_EXISTING) != FR_OK)
+	if (f_open_char(&dat, SLIPPI_DAT_FILE, FA_READ|FA_OPEN_EXISTING) != FR_OK) {
+		gprintf("LoadSlippiDat: File not found, using defaults\r\n");
 		return false;
+	}
 
 	f_read(&dat, slippi_settings, sizeof(struct slippi_settings), &BytesRead);
 	f_close(&dat);
-	if (BytesRead != sizeof(struct slippi_settings))
+	
+	if (BytesRead < 68) {  // At minimum need rtc_bias + nickname fields
+		gprintf("LoadSlippiDat: File too small (%d bytes), using defaults\r\n", BytesRead);
+		// Reset to safe defaults if file is corrupted/incomplete
+		memset(slippi_settings, 0, sizeof(struct slippi_settings));
+		slippi_settings->ftp_enabled = 0;
+		slippi_settings->ftp_port = 21;
+		strcpy(slippi_settings->ftp_directory, "/");
 		ConfigLoaded = false;
+	} else if (BytesRead != sizeof(struct slippi_settings)) {
+		gprintf("LoadSlippiDat: Partial file (%d/%d bytes), setting safe FTP defaults\r\n", 
+			BytesRead, sizeof(struct slippi_settings));
+		// File exists but is from older version without FTP fields
+		// Keep existing data but ensure FTP fields have safe defaults
+		if (BytesRead < sizeof(struct slippi_settings)) {
+			// Zero out any unread FTP fields and set safe defaults
+			char* ftp_start = (char*)slippi_settings + 68; // After nickname field
+			memset(ftp_start, 0, sizeof(struct slippi_settings) - 68);
+			slippi_settings->ftp_enabled = 0;
+			slippi_settings->ftp_port = 21;
+			strcpy(slippi_settings->ftp_directory, "/");
+		}
+		ConfigLoaded = true; // Consider this successful since we have basic config
+	} else {
+		gprintf("LoadSlippiDat: Successfully loaded %d bytes\r\n", BytesRead);
+	}
 
 	// Always NUL-terminate the nickname string (... just in case)
 	slippi_settings->nickname[31] = 0x00;
+	
+	// Validate FTP settings and set safe defaults if needed
+	if (slippi_settings->ftp_port == 0) {
+		slippi_settings->ftp_port = 21;
+	}
+	if (slippi_settings->ftp_directory[0] == 0) {
+		strcpy(slippi_settings->ftp_directory, "/");
+	}
+	
+	gprintf("LoadSlippiDat: FTP enabled=%d, server='%s', port=%d\r\n", 
+		slippi_settings->ftp_enabled, slippi_settings->ftp_server, slippi_settings->ftp_port);
 
 	return ConfigLoaded;
 }
