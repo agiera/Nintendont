@@ -59,7 +59,6 @@ static int slippi_ftp_send_command(slippi_ftp_client_t* client, const char* comm
 static void slippi_ftp_disconnect(slippi_ftp_client_t* client);
 static int transfer_exact(int socket, char *buf, int length, int is_send);
 static int send_from_file(int data_socket, const char* filepath);
-static void slippi_ftp_clear_responses(slippi_ftp_client_t* client);
 
 // Initialize FTP client system
 int slippi_ftp_init(void) {
@@ -842,26 +841,6 @@ static void slippi_ftp_disconnect(slippi_ftp_client_t* client) {
 	client->connected = 0;
 	client->authenticated = 0;
 	memset(client->response_buffer, 0, sizeof(client->response_buffer));
-}
-
-// Clear any pending responses from the socket
-static void slippi_ftp_clear_responses(slippi_ftp_client_t* client) {
-	extern s32 top_fd;
-	
-	if (!client || client->socket < 0) {
-		return;
-	}
-	
-	// Try to read any pending data with a very short timeout
-	char dummy_buffer[256];
-	int i;
-	for (i = 0; i < 5; i++) { // Max 5 attempts
-		s32 bytes_read = recvfrom(top_fd, client->socket, dummy_buffer, sizeof(dummy_buffer), 0);
-		if (bytes_read <= 0) {
-			break; // No more data or error
-		}
-		dbgprintf("FTP: Cleared %d pending bytes\r\n", bytes_read);
-	}
 }
 
 // Streaming upload functions

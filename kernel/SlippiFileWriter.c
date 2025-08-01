@@ -1,7 +1,6 @@
 #include "SlippiFileWriter.h"
 #include "SlippiMemory.h"
 #include "SlippiFTP.h"
-#include "SlippiSceneMonitor.h"
 #include "alloc.h"
 #include "debug.h"
 #include "string.h"
@@ -60,9 +59,6 @@ void SlippiFileWriterInit(bool led)
 		dbgprintf("SlippiFileWriter: Initializing FTP system\r\n");
 		if (slippi_ftp_init() == SLIPPI_FTP_SUCCESS) {
 			dbgprintf("SlippiFileWriter: FTP init successful\r\n");
-			// Initialize scene monitoring system only when FTP is enabled
-			slippi_scene_monitor_init();
-			dbgprintf("SlippiFileWriter: Scene monitor init successful\r\n");
 		} else {
 			dbgprintf("SlippiFileWriter: FTP init failed\r\n");
 		}
