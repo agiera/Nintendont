@@ -38,13 +38,7 @@ static char* strcat_impl(char* dest, const char* src) {
 }
 
 // Global state
-static slippi_ftp_queue_entry_t ftp_queue[SLIPPI_FTP_QUEUE_SIZE];
-static int queue_head = 0;
-static int queue_tail = 0;
-static int queue_count = 0;
-static slippi_ftp_client_t ftp_client;
 static int ftp_initialized = 0;
-static int upload_in_progress = 0;
 
 // Streaming upload state
 static slippi_ftp_stream_t stream_upload;
@@ -69,18 +63,7 @@ int slippi_ftp_init(void) {
 		return SLIPPI_FTP_SUCCESS;
 	}
 	
-	dbgprintf("FTP: Clearing queue and client state...\r\n");
-	// Clear queue
-	memset(ftp_queue, 0, sizeof(ftp_queue));
-	queue_head = 0;
-	queue_tail = 0;
-	queue_count = 0;
-	
-	// Clear client state
-	memset(&ftp_client, 0, sizeof(ftp_client));
-	ftp_client.socket = -1;
-	ftp_client.connected = 0;
-	ftp_client.authenticated = 0;
+	dbgprintf("FTP: Clearing streaming state...\r\n");
 	
 	// Clear streaming state
 	memset(&stream_upload, 0, sizeof(stream_upload));
@@ -88,7 +71,6 @@ int slippi_ftp_init(void) {
 	memset(&stream_client, 0, sizeof(stream_client));
 	stream_client.socket = -1;
 	
-	upload_in_progress = 0;
 	ftp_initialized = 1;
 	
 	dbgprintf("FTP: Initialization complete\r\n");
@@ -104,216 +86,7 @@ void slippi_ftp_cleanup(void) {
 	// Cancel any active streaming upload
 	slippi_ftp_cancel_stream_upload();
 	
-	slippi_ftp_disconnect(&ftp_client);
-	
-	// Clear queue
-	memset(ftp_queue, 0, sizeof(ftp_queue));
-	queue_head = 0;
-	queue_tail = 0;
-	queue_count = 0;
-	
 	ftp_initialized = 0;
-	upload_in_progress = 0;
-}
-
-// Add a replay file to the upload queue
-int slippi_ftp_queue_replay(const char* filepath) {
-	if (!filepath) {
-		return SLIPPI_FTP_ERROR;
-	}
-	
-	if (!ftp_initialized) {
-		// If FTP is not initialized (disabled), just return success to avoid errors
-		return SLIPPI_FTP_SUCCESS;
-	}
-	
-	if (queue_count >= SLIPPI_FTP_QUEUE_SIZE) {
-		return SLIPPI_FTP_ERROR;
-	}
-	
-	// Extract filename from full path
-	const char* filename = strrchr_impl(filepath, '/');
-	if (!filename) {
-		filename = filepath;
-	} else {
-		filename++; // Skip the '/'
-	}
-	
-	// Add to queue
-	strncpy(ftp_queue[queue_tail].filepath, filepath, sizeof(ftp_queue[queue_tail].filepath) - 1);
-	strncpy(ftp_queue[queue_tail].filename, filename, sizeof(ftp_queue[queue_tail].filename) - 1);
-	ftp_queue[queue_tail].queued = 1;
-	
-	queue_tail = (queue_tail + 1) % SLIPPI_FTP_QUEUE_SIZE;
-	queue_count++;
-	
-	return SLIPPI_FTP_SUCCESS;
-}
-
-// Upload all queued replay files
-int slippi_ftp_upload_queued_replays(void) {
-	if (!ftp_initialized || queue_count == 0 || upload_in_progress) {
-		dbgprintf("FTP: Upload skipped - initialized=%d, queue_count=%d, in_progress=%d\r\n", 
-			ftp_initialized, queue_count, upload_in_progress);
-		return SLIPPI_FTP_ERROR;
-	}
-	
-	// Check if FTP is enabled in config
-	if (!slippi_settings || !slippi_settings->ftp_enabled) {
-		dbgprintf("FTP: Upload skipped - settings unavailable or FTP disabled\r\n");
-		return SLIPPI_FTP_ERROR;
-	}
-	
-	// Debug FTP settings
-	dbgprintf("FTP: Attempting upload with server=%s, port=%d, user=%s\r\n",
-		slippi_settings->ftp_server, slippi_settings->ftp_port, slippi_settings->ftp_username);
-	dbgprintf("FTP: FTP password=%s, directory=%s\r\n",
-		slippi_settings->ftp_password, slippi_settings->ftp_directory);
-	dbgprintf("FTP: FTP enabled=%d\r\n", slippi_settings->ftp_enabled);
-	
-	upload_in_progress = 1;
-	
-	// Connect to FTP server
-	dbgprintf("FTP: Connecting to %s:%d\r\n", slippi_settings->ftp_server, slippi_settings->ftp_port);
-	int connect_result = slippi_ftp_connect(&ftp_client, slippi_settings->ftp_server, slippi_settings->ftp_port);
-	if (connect_result != SLIPPI_FTP_SUCCESS) {
-		upload_in_progress = 0;
-		dbgprintf("FTP: Connection failed\r\n");
-		return connect_result; // Return the specific error code
-	}
-	
-	// Authenticate
-	int auth_result = slippi_ftp_authenticate(&ftp_client, slippi_settings->ftp_username, slippi_settings->ftp_password);
-	if (auth_result != SLIPPI_FTP_SUCCESS) {
-		slippi_ftp_disconnect(&ftp_client);
-		upload_in_progress = 0;
-		return auth_result; // Return the specific error code (could be CONNECT_FAIL or AUTH_FAIL)
-	}
-	
-	// Upload each file in queue
-	int uploaded = 0;
-	int failed = 0;
-	while (queue_count > 0) {
-		slippi_ftp_queue_entry_t* entry = &ftp_queue[queue_head];
-		
-		if (entry->queued) {
-			// Check if we're still connected before each upload
-			if (!ftp_client.connected) {
-				dbgprintf("FTP: Connection lost during upload queue processing\r\n");
-				// Try to reconnect once
-				if (slippi_ftp_connect(&ftp_client, slippi_settings->ftp_server, slippi_settings->ftp_port) != SLIPPI_FTP_SUCCESS) {
-					dbgprintf("FTP: Reconnection failed, aborting remaining uploads\r\n");
-					break;
-				}
-				if (slippi_ftp_authenticate(&ftp_client, slippi_settings->ftp_username, slippi_settings->ftp_password) != SLIPPI_FTP_SUCCESS) {
-					dbgprintf("FTP: Re-authentication failed, aborting remaining uploads\r\n");
-					slippi_ftp_disconnect(&ftp_client);
-					break;
-				}
-				dbgprintf("FTP: Successfully reconnected and re-authenticated\r\n");
-			}
-			
-			// Construct remote path
-			char remote_path[256];
-			if (strlen(slippi_settings->ftp_directory) > 0 && strcmp(slippi_settings->ftp_directory, "/") != 0) {
-				// Directory is specified and not root, so add directory + filename
-				_sprintf(remote_path, "%s/%s", slippi_settings->ftp_directory, entry->filename);
-			} else {
-				// Directory is root or empty, just use filename
-				strncpy(remote_path, entry->filename, sizeof(remote_path) - 1);
-				remote_path[sizeof(remote_path) - 1] = '\0';
-			}
-			
-			dbgprintf("FTP: Uploading %s to %s\r\n", entry->filepath, remote_path);
-			
-			// Check if file exists before attempting upload
-			FIL test_file;
-			FRESULT file_check = f_open_secondary_drive(&test_file, entry->filepath, FA_READ);
-			if (file_check != FR_OK) {
-				dbgprintf("FTP: File access failed: %s (FRESULT=%d)\r\n", entry->filepath, file_check);
-				
-				// Try multiple times with increasing delays - file might still be open
-				int retry_attempts = 3;
-				int retry;
-				for (retry = 0; retry < retry_attempts; retry++) {
-					dbgprintf("FTP: Retry attempt %d/%d\r\n", retry + 1, retry_attempts);
-					
-					// Longer delay for each retry
-					volatile int delay_count;
-					for (delay_count = 0; delay_count < (500000 * (retry + 1)); delay_count++);
-					
-					// Retry file access
-					file_check = f_open_secondary_drive(&test_file, entry->filepath, FA_READ);
-					if (file_check == FR_OK) {
-						f_close(&test_file);
-						dbgprintf("FTP: File access successful after retry %d\r\n", retry + 1);
-						
-						// Upload file
-						int upload_result = slippi_ftp_upload_file(&ftp_client, entry->filepath, remote_path);
-						if (upload_result == SLIPPI_FTP_SUCCESS) {
-							uploaded++;
-						} else if (upload_result == SLIPPI_FTP_CONNECT_FAIL) {
-							dbgprintf("FTP: Connection lost during upload, stopping queue processing\r\n");
-							failed++;
-							goto upload_queue_done; // Break out of both loops
-						} else {
-							failed++;
-						}
-						break;
-					}
-				}
-				
-				if (file_check != FR_OK) {
-					dbgprintf("FTP: File not accessible after %d retries, skipping: %s (FRESULT=%d)\r\n", retry_attempts, entry->filepath, file_check);
-					failed++;
-				}
-			} else {
-				f_close(&test_file);
-				
-				// Upload file
-				int upload_result = slippi_ftp_upload_file(&ftp_client, entry->filepath, remote_path);
-				if (upload_result == SLIPPI_FTP_SUCCESS) {
-					uploaded++;
-				} else if (upload_result == SLIPPI_FTP_CONNECT_FAIL) {
-					dbgprintf("FTP: Connection lost during upload, stopping queue processing\r\n");
-					failed++;
-					goto upload_queue_done; // Break out of loop
-				} else {
-					failed++;
-				}
-			}
-		}
-		
-		// Remove from queue
-		entry->queued = 0;
-		queue_head = (queue_head + 1) % SLIPPI_FTP_QUEUE_SIZE;
-		queue_count--;
-	}
-	
-upload_queue_done:
-	
-	slippi_ftp_disconnect(&ftp_client);
-	upload_in_progress = 0;
-	
-	dbgprintf("FTP: Upload complete - uploaded: %d, failed: %d\r\n", uploaded, failed);
-	return uploaded > 0 ? SLIPPI_FTP_SUCCESS : SLIPPI_FTP_UPLOAD_FAIL;
-}
-
-// Cancel any uploads in progress
-void slippi_ftp_cancel_uploads(void) {
-	if (!ftp_initialized) {
-		return;
-	}
-	
-	if (upload_in_progress) {
-		slippi_ftp_disconnect(&ftp_client);
-		upload_in_progress = 0;
-	}
-}
-
-// Get number of files in upload queue
-int slippi_ftp_get_queue_count(void) {
-	return queue_count;
 }
 
 // Connect to FTP server

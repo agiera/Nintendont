@@ -18,16 +18,6 @@ Based on ftpii FTP implementation
 #define SLIPPI_FTP_AUTH_FAIL	-3
 #define SLIPPI_FTP_UPLOAD_FAIL	-4
 
-// Maximum queue size for pending uploads
-#define SLIPPI_FTP_QUEUE_SIZE	32
-
-// Structure for queued replay files
-typedef struct {
-    char filepath[256];
-    char filename[64];
-    int queued;
-} slippi_ftp_queue_entry_t;
-
 // FTP client state
 typedef struct {
     int socket;
@@ -49,10 +39,6 @@ typedef struct {
 // Public function prototypes
 int slippi_ftp_init(void);
 void slippi_ftp_cleanup(void);
-int slippi_ftp_queue_replay(const char* filepath);
-int slippi_ftp_upload_queued_replays(void);
-void slippi_ftp_cancel_uploads(void);
-int slippi_ftp_get_queue_count(void);
 
 // Streaming upload functions
 int slippi_ftp_start_stream_upload(const char* local_path, const char* remote_path);
