@@ -175,17 +175,19 @@ int slippi_ftp_upload_queued_replays(void) {
 	
 	// Connect to FTP server
 	dbgprintf("FTP: Connecting to %s:%d\r\n", slippi_settings->ftp_server, slippi_settings->ftp_port);
-	if (slippi_ftp_connect(&ftp_client, slippi_settings->ftp_server, slippi_settings->ftp_port) != SLIPPI_FTP_SUCCESS) {
+	int connect_result = slippi_ftp_connect(&ftp_client, slippi_settings->ftp_server, slippi_settings->ftp_port);
+	if (connect_result != SLIPPI_FTP_SUCCESS) {
 		upload_in_progress = 0;
 		dbgprintf("FTP: Connection failed\r\n");
-		return SLIPPI_FTP_CONNECT_FAIL;
+		return connect_result; // Return the specific error code
 	}
 	
 	// Authenticate
-	if (slippi_ftp_authenticate(&ftp_client, slippi_settings->ftp_username, slippi_settings->ftp_password) != SLIPPI_FTP_SUCCESS) {
+	int auth_result = slippi_ftp_authenticate(&ftp_client, slippi_settings->ftp_username, slippi_settings->ftp_password);
+	if (auth_result != SLIPPI_FTP_SUCCESS) {
 		slippi_ftp_disconnect(&ftp_client);
 		upload_in_progress = 0;
-		return SLIPPI_FTP_AUTH_FAIL;
+		return auth_result; // Return the specific error code (could be CONNECT_FAIL or AUTH_FAIL)
 	}
 	
 	// Upload each file in queue
@@ -195,6 +197,22 @@ int slippi_ftp_upload_queued_replays(void) {
 		slippi_ftp_queue_entry_t* entry = &ftp_queue[queue_head];
 		
 		if (entry->queued) {
+			// Check if we're still connected before each upload
+			if (!ftp_client.connected) {
+				dbgprintf("FTP: Connection lost during upload queue processing\r\n");
+				// Try to reconnect once
+				if (slippi_ftp_connect(&ftp_client, slippi_settings->ftp_server, slippi_settings->ftp_port) != SLIPPI_FTP_SUCCESS) {
+					dbgprintf("FTP: Reconnection failed, aborting remaining uploads\r\n");
+					break;
+				}
+				if (slippi_ftp_authenticate(&ftp_client, slippi_settings->ftp_username, slippi_settings->ftp_password) != SLIPPI_FTP_SUCCESS) {
+					dbgprintf("FTP: Re-authentication failed, aborting remaining uploads\r\n");
+					slippi_ftp_disconnect(&ftp_client);
+					break;
+				}
+				dbgprintf("FTP: Successfully reconnected and re-authenticated\r\n");
+			}
+			
 			// Construct remote path
 			char remote_path[256];
 			if (strlen(slippi_settings->ftp_directory) > 0 && strcmp(slippi_settings->ftp_directory, "/") != 0) {
@@ -231,8 +249,13 @@ int slippi_ftp_upload_queued_replays(void) {
 						dbgprintf("FTP: File access successful after retry %d\r\n", retry + 1);
 						
 						// Upload file
-						if (slippi_ftp_upload_file(&ftp_client, entry->filepath, remote_path) == SLIPPI_FTP_SUCCESS) {
+						int upload_result = slippi_ftp_upload_file(&ftp_client, entry->filepath, remote_path);
+						if (upload_result == SLIPPI_FTP_SUCCESS) {
 							uploaded++;
+						} else if (upload_result == SLIPPI_FTP_CONNECT_FAIL) {
+							dbgprintf("FTP: Connection lost during upload, stopping queue processing\r\n");
+							failed++;
+							goto upload_queue_done; // Break out of both loops
 						} else {
 							failed++;
 						}
@@ -248,8 +271,13 @@ int slippi_ftp_upload_queued_replays(void) {
 				f_close(&test_file);
 				
 				// Upload file
-				if (slippi_ftp_upload_file(&ftp_client, entry->filepath, remote_path) == SLIPPI_FTP_SUCCESS) {
+				int upload_result = slippi_ftp_upload_file(&ftp_client, entry->filepath, remote_path);
+				if (upload_result == SLIPPI_FTP_SUCCESS) {
 					uploaded++;
+				} else if (upload_result == SLIPPI_FTP_CONNECT_FAIL) {
+					dbgprintf("FTP: Connection lost during upload, stopping queue processing\r\n");
+					failed++;
+					goto upload_queue_done; // Break out of loop
 				} else {
 					failed++;
 				}
@@ -261,6 +289,8 @@ int slippi_ftp_upload_queued_replays(void) {
 		queue_head = (queue_head + 1) % SLIPPI_FTP_QUEUE_SIZE;
 		queue_count--;
 	}
+	
+upload_queue_done:
 	
 	slippi_ftp_disconnect(&ftp_client);
 	upload_in_progress = 0;
@@ -435,6 +465,7 @@ static int send_from_file(int data_socket, const char* filepath) {
 		return send_result;
 	}
 }
+// Authenticate with FTP server
 static int slippi_ftp_authenticate(slippi_ftp_client_t* client, const char* username, const char* password) {
 	dbgprintf("FTP: Starting authentication...\r\n");
 	
@@ -448,8 +479,12 @@ static int slippi_ftp_authenticate(slippi_ftp_client_t* client, const char* user
 	_sprintf(user_cmd, "USER %s", username);
 	
 	dbgprintf("FTP: Sending USER command...\r\n");
-	if (slippi_ftp_send_command(client, user_cmd) != SLIPPI_FTP_SUCCESS) {
+	int send_result = slippi_ftp_send_command(client, user_cmd);
+	if (send_result != SLIPPI_FTP_SUCCESS) {
 		dbgprintf("FTP: Failed to send USER command\r\n");
+		if (send_result == SLIPPI_FTP_CONNECT_FAIL) {
+			return SLIPPI_FTP_CONNECT_FAIL;
+		}
 		return SLIPPI_FTP_AUTH_FAIL;
 	}
 	
@@ -457,6 +492,11 @@ static int slippi_ftp_authenticate(slippi_ftp_client_t* client, const char* user
 	dbgprintf("FTP: Reading USER response...\r\n");
 	int response_code = slippi_ftp_read_response(client);
 	dbgprintf("FTP: USER response code: %d\r\n", response_code);
+	
+	if (response_code == SLIPPI_FTP_ERROR || response_code == SLIPPI_FTP_CONNECT_FAIL) {
+		dbgprintf("FTP: Lost connection during USER command\r\n");
+		return SLIPPI_FTP_CONNECT_FAIL;
+	}
 	
 	if (response_code == 230) {
 		// Anonymous user is already logged in, no password needed
@@ -473,8 +513,12 @@ static int slippi_ftp_authenticate(slippi_ftp_client_t* client, const char* user
 	_sprintf(pass_cmd, "PASS %s", password);
 	
 	dbgprintf("FTP: Sending PASS command...\r\n");
-	if (slippi_ftp_send_command(client, pass_cmd) != SLIPPI_FTP_SUCCESS) {
+	send_result = slippi_ftp_send_command(client, pass_cmd);
+	if (send_result != SLIPPI_FTP_SUCCESS) {
 		dbgprintf("FTP: Failed to send PASS command\r\n");
+		if (send_result == SLIPPI_FTP_CONNECT_FAIL) {
+			return SLIPPI_FTP_CONNECT_FAIL;
+		}
 		return SLIPPI_FTP_AUTH_FAIL;
 	}
 	
@@ -482,6 +526,12 @@ static int slippi_ftp_authenticate(slippi_ftp_client_t* client, const char* user
 	dbgprintf("FTP: Reading PASS response...\r\n");
 	response_code = slippi_ftp_read_response(client);
 	dbgprintf("FTP: PASS response code: %d\r\n", response_code);
+	
+	if (response_code == SLIPPI_FTP_ERROR || response_code == SLIPPI_FTP_CONNECT_FAIL) {
+		dbgprintf("FTP: Lost connection during PASS command\r\n");
+		return SLIPPI_FTP_CONNECT_FAIL;
+	}
+	
 	if (response_code != 230) {
 		dbgprintf("FTP: PASS command failed with code %d\r\n", response_code);
 		return SLIPPI_FTP_AUTH_FAIL;
@@ -505,14 +555,22 @@ static int slippi_ftp_upload_file(slippi_ftp_client_t* client, const char* local
 	
 	// Set binary mode (TYPE I)
 	dbgprintf("FTP: Sending TYPE I command\r\n");
-	if (slippi_ftp_send_command(client, "TYPE I") != SLIPPI_FTP_SUCCESS) {
+	int send_result = slippi_ftp_send_command(client, "TYPE I");
+	if (send_result != SLIPPI_FTP_SUCCESS) {
 		dbgprintf("FTP: Failed to send TYPE command\r\n");
+		if (send_result == SLIPPI_FTP_CONNECT_FAIL) {
+			return SLIPPI_FTP_CONNECT_FAIL;
+		}
 		return SLIPPI_FTP_UPLOAD_FAIL;
 	}
 	
 	dbgprintf("FTP: Reading TYPE response\r\n");
 	int response_code = slippi_ftp_read_response(client);
 	dbgprintf("FTP: TYPE response code: %d\r\n", response_code);
+	if (response_code == SLIPPI_FTP_ERROR || response_code == SLIPPI_FTP_CONNECT_FAIL) {
+		dbgprintf("FTP: Lost connection during TYPE command\r\n");
+		return SLIPPI_FTP_CONNECT_FAIL;
+	}
 	if (response_code != 200) {
 		dbgprintf("FTP: TYPE command failed with code %d\r\n", response_code);
 		return SLIPPI_FTP_UPLOAD_FAIL;
@@ -520,14 +578,22 @@ static int slippi_ftp_upload_file(slippi_ftp_client_t* client, const char* local
 	
 	// Enter passive mode (PASV)
 	dbgprintf("FTP: Sending PASV command\r\n");
-	if (slippi_ftp_send_command(client, "PASV") != SLIPPI_FTP_SUCCESS) {
+	send_result = slippi_ftp_send_command(client, "PASV");
+	if (send_result != SLIPPI_FTP_SUCCESS) {
 		dbgprintf("FTP: Failed to send PASV command\r\n");
+		if (send_result == SLIPPI_FTP_CONNECT_FAIL) {
+			return SLIPPI_FTP_CONNECT_FAIL;
+		}
 		return SLIPPI_FTP_UPLOAD_FAIL;
 	}
 	
 	dbgprintf("FTP: Reading PASV response\r\n");
 	response_code = slippi_ftp_read_response(client);
 	dbgprintf("FTP: PASV response code: %d\r\n", response_code);
+	if (response_code == SLIPPI_FTP_ERROR || response_code == SLIPPI_FTP_CONNECT_FAIL) {
+		dbgprintf("FTP: Lost connection during PASV command\r\n");
+		return SLIPPI_FTP_CONNECT_FAIL;
+	}
 	if (response_code != 227) {
 		dbgprintf("FTP: PASV command failed with code %d\r\n", response_code);
 		return SLIPPI_FTP_UPLOAD_FAIL;
@@ -617,9 +683,13 @@ pasv_success:
 	_sprintf(stor_cmd, "STOR %s", remote_path);
 	
 	dbgprintf("FTP: Sending STOR command: %s\r\n", stor_cmd);
-	if (slippi_ftp_send_command(client, stor_cmd) != SLIPPI_FTP_SUCCESS) {
+	send_result = slippi_ftp_send_command(client, stor_cmd);
+	if (send_result != SLIPPI_FTP_SUCCESS) {
 		dbgprintf("FTP: Failed to send STOR command\r\n");
 		close(top_fd, data_socket);
+		if (send_result == SLIPPI_FTP_CONNECT_FAIL) {
+			return SLIPPI_FTP_CONNECT_FAIL;
+		}
 		return SLIPPI_FTP_UPLOAD_FAIL;
 	}
 	
@@ -627,6 +697,11 @@ pasv_success:
 	dbgprintf("FTP: Reading STOR response\r\n");
 	response_code = slippi_ftp_read_response(client);
 	dbgprintf("FTP: STOR response code: %d\r\n", response_code);
+	if (response_code == SLIPPI_FTP_ERROR || response_code == SLIPPI_FTP_CONNECT_FAIL) {
+		dbgprintf("FTP: Lost connection during STOR command\r\n");
+		close(top_fd, data_socket);
+		return SLIPPI_FTP_CONNECT_FAIL;
+	}
 	if (response_code != 150) {
 		dbgprintf("FTP: STOR command failed with code %d\r\n", response_code);
 		close(top_fd, data_socket);
@@ -653,6 +728,10 @@ pasv_success:
 	dbgprintf("FTP: Reading final transfer response\r\n");
 	response_code = slippi_ftp_read_response(client);
 	dbgprintf("FTP: Final transfer response code: %d\r\n", response_code);
+	if (response_code == SLIPPI_FTP_ERROR || response_code == SLIPPI_FTP_CONNECT_FAIL) {
+		dbgprintf("FTP: Lost connection during final transfer response\r\n");
+		return SLIPPI_FTP_CONNECT_FAIL;
+	}
 	if (response_code != 226) {
 		dbgprintf("FTP: Transfer completion failed with code %d\r\n", response_code);
 		return SLIPPI_FTP_UPLOAD_FAIL;
@@ -670,6 +749,12 @@ static int slippi_ftp_read_response(slippi_ftp_client_t* client) {
 		return SLIPPI_FTP_ERROR;
 	}
 	
+	// Check if we're still connected
+	if (!client->connected) {
+		dbgprintf("FTP: Client not connected, aborting response read\r\n");
+		return SLIPPI_FTP_ERROR;
+	}
+	
 	// Read response with proper multi-line handling
 	int total_read = 0;
 	int response_code = -1;
@@ -677,6 +762,8 @@ static int slippi_ftp_read_response(slippi_ftp_client_t* client) {
 	int line_pos = 0;
 	bool is_multi_line = false;
 	int lines_read = 0;
+	int consecutive_failures = 0;
+	const int max_consecutive_failures = 10;
 	
 	dbgprintf("FTP: Starting to read response...\r\n");
 	
@@ -685,11 +772,26 @@ static int slippi_ftp_read_response(slippi_ftp_client_t* client) {
 		s32 bytes_read = recvfrom(top_fd, client->socket, &ch, 1, 0);
 		
 		if (bytes_read <= 0) {
-			if (bytes_read < 0) {
-				continue; // Retry on network error
+			consecutive_failures++;
+			if (bytes_read == 0) {
+				// Connection closed by server
+				dbgprintf("FTP: Server closed connection during response read\r\n");
+				client->connected = 0;
+				return SLIPPI_FTP_CONNECT_FAIL;
+			} else if (bytes_read < 0) {
+				// Network error
+				if (consecutive_failures >= max_consecutive_failures) {
+					dbgprintf("FTP: Too many consecutive network errors (%d), assuming disconnection\r\n", consecutive_failures);
+					client->connected = 0;
+					return SLIPPI_FTP_CONNECT_FAIL;
+				}
+				// Small delay before retry
+				volatile int delay_count;
+				for (delay_count = 0; delay_count < 50000; delay_count++);
+				continue;
 			}
-			dbgprintf("FTP: Connection closed while reading response\r\n");
-			return SLIPPI_FTP_ERROR;
+		} else {
+			consecutive_failures = 0; // Reset on successful read
 		}
 		
 		if (ch == '\n') {
@@ -757,7 +859,9 @@ static int transfer_exact(int socket, char *buf, int length, int is_send) {
 	int remaining = length;
 	int bytes_transferred;
 	int timeout_attempts = 0;
+	int connection_failures = 0;
 	const int max_timeout_attempts = 100; // About 10 seconds of retries
+	const int max_connection_failures = 5; // Allow a few connection failures before giving up
 	
 	while (remaining > 0) {
 		if (is_send) {
@@ -770,6 +874,22 @@ static int transfer_exact(int socket, char *buf, int length, int is_send) {
 			remaining -= bytes_transferred;
 			buf += bytes_transferred;
 			timeout_attempts = 0; // Reset timeout counter on successful transfer
+			connection_failures = 0; // Reset connection failure counter
+		} else if (bytes_transferred == 0) {
+			// Connection closed by peer
+			connection_failures++;
+			dbgprintf("FTP: Connection closed by peer during transfer (attempt %d/%d)\r\n", 
+				connection_failures, max_connection_failures);
+			if (connection_failures >= max_connection_failures) {
+				dbgprintf("FTP: Too many connection failures, aborting transfer\r\n");
+				result = -1;
+				break;
+			}
+			// Small delay before giving up
+			volatile int delay_count;
+			for (delay_count = 0; delay_count < 200000; delay_count++);
+			result = -1;
+			break;
 		} else if (bytes_transferred < 0) {
 			// Network error - could be temporary, try again with timeout
 			timeout_attempts++;
@@ -782,9 +902,6 @@ static int transfer_exact(int socket, char *buf, int length, int is_send) {
 			volatile int delay_count;
 			for (delay_count = 0; delay_count < 100000; delay_count++);
 			continue;
-		} else {
-			result = -1; // Connection closed
-			break;
 		}
 	}
 	
@@ -794,6 +911,12 @@ static int slippi_ftp_send_command(slippi_ftp_client_t* client, const char* comm
 	extern s32 top_fd;
 	
 	if (!client || !command || client->socket < 0) {
+		return SLIPPI_FTP_ERROR;
+	}
+	
+	// Check if we're still connected before sending
+	if (!client->connected) {
+		dbgprintf("FTP: Client not connected, cannot send command: %s\r\n", command);
 		return SLIPPI_FTP_ERROR;
 	}
 	
@@ -812,8 +935,10 @@ static int slippi_ftp_send_command(slippi_ftp_client_t* client, const char* comm
 	int result = transfer_exact(client->socket, cmd_buffer, total_len, 1);
 	
 	if (result < 0) {
-		dbgprintf("FTP: Failed to send command: %s\r\n", command);
-		return SLIPPI_FTP_ERROR;
+		dbgprintf("FTP: Failed to send command: %s (connection may be lost)\r\n", command);
+		// Mark connection as lost
+		client->connected = 0;
+		return SLIPPI_FTP_CONNECT_FAIL;
 	}
 	
 	dbgprintf("FTP: Sent command: %s\r\n", command);
@@ -824,15 +949,22 @@ static int slippi_ftp_send_command(slippi_ftp_client_t* client, const char* comm
 static void slippi_ftp_disconnect(slippi_ftp_client_t* client) {
 	extern s32 top_fd;
 	
+	if (!client) {
+		return;
+	}
+	
 	if (client->socket >= 0) {
-		// Send QUIT command if still connected
+		// Send QUIT command if still connected, but don't fail if it doesn't work
 		if (client->connected) {
+			dbgprintf("FTP: Sending QUIT command before disconnect\r\n");
+			// Don't check result - connection might already be lost
 			slippi_ftp_send_command(client, "QUIT");
-			// Read response but don't check for errors since we're disconnecting anyway
+			// Try to read response but ignore errors
 			slippi_ftp_read_response(client);
 		}
 		
 		// Close socket
+		dbgprintf("FTP: Closing socket %d\r\n", client->socket);
 		close(top_fd, client->socket);
 		client->socket = -1;
 	}
@@ -841,6 +973,7 @@ static void slippi_ftp_disconnect(slippi_ftp_client_t* client) {
 	client->connected = 0;
 	client->authenticated = 0;
 	memset(client->response_buffer, 0, sizeof(client->response_buffer));
+	dbgprintf("FTP: Disconnect complete\r\n");
 }
 
 // Streaming upload functions
@@ -880,24 +1013,40 @@ int slippi_ftp_start_stream_upload(const char* local_path, const char* remote_pa
 	}
 	
 	// Set binary mode
-	if (slippi_ftp_send_command(&stream_client, "TYPE I") != SLIPPI_FTP_SUCCESS) {
+	int send_result = slippi_ftp_send_command(&stream_client, "TYPE I");
+	if (send_result != SLIPPI_FTP_SUCCESS) {
 		slippi_ftp_disconnect(&stream_client);
+		if (send_result == SLIPPI_FTP_CONNECT_FAIL) {
+			return SLIPPI_FTP_CONNECT_FAIL;
+		}
 		return SLIPPI_FTP_UPLOAD_FAIL;
 	}
 	
 	int response_code = slippi_ftp_read_response(&stream_client);
+	if (response_code == SLIPPI_FTP_ERROR || response_code == SLIPPI_FTP_CONNECT_FAIL) {
+		slippi_ftp_disconnect(&stream_client);
+		return SLIPPI_FTP_CONNECT_FAIL;
+	}
 	if (response_code != 200) {
 		slippi_ftp_disconnect(&stream_client);
 		return SLIPPI_FTP_UPLOAD_FAIL;
 	}
 	
 	// Enter passive mode
-	if (slippi_ftp_send_command(&stream_client, "PASV") != SLIPPI_FTP_SUCCESS) {
+	send_result = slippi_ftp_send_command(&stream_client, "PASV");
+	if (send_result != SLIPPI_FTP_SUCCESS) {
 		slippi_ftp_disconnect(&stream_client);
+		if (send_result == SLIPPI_FTP_CONNECT_FAIL) {
+			return SLIPPI_FTP_CONNECT_FAIL;
+		}
 		return SLIPPI_FTP_UPLOAD_FAIL;
 	}
 	
 	response_code = slippi_ftp_read_response(&stream_client);
+	if (response_code == SLIPPI_FTP_ERROR || response_code == SLIPPI_FTP_CONNECT_FAIL) {
+		slippi_ftp_disconnect(&stream_client);
+		return SLIPPI_FTP_CONNECT_FAIL;
+	}
 	if (response_code != 227) {
 		slippi_ftp_disconnect(&stream_client);
 		return SLIPPI_FTP_UPLOAD_FAIL;
@@ -965,15 +1114,25 @@ stream_pasv_success:
 	char stor_cmd[256];
 	_sprintf(stor_cmd, "STOR %s", remote_path);
 	
-	if (slippi_ftp_send_command(&stream_client, stor_cmd) != SLIPPI_FTP_SUCCESS) {
+	send_result = slippi_ftp_send_command(&stream_client, stor_cmd);
+	if (send_result != SLIPPI_FTP_SUCCESS) {
 		close(top_fd, stream_upload.data_socket);
 		stream_upload.data_socket = -1;
 		slippi_ftp_disconnect(&stream_client);
+		if (send_result == SLIPPI_FTP_CONNECT_FAIL) {
+			return SLIPPI_FTP_CONNECT_FAIL;
+		}
 		return SLIPPI_FTP_UPLOAD_FAIL;
 	}
 	
 	// Read initial response
 	response_code = slippi_ftp_read_response(&stream_client);
+	if (response_code == SLIPPI_FTP_ERROR || response_code == SLIPPI_FTP_CONNECT_FAIL) {
+		close(top_fd, stream_upload.data_socket);
+		stream_upload.data_socket = -1;
+		slippi_ftp_disconnect(&stream_client);
+		return SLIPPI_FTP_CONNECT_FAIL;
+	}
 	if (response_code != 150) {
 		close(top_fd, stream_upload.data_socket);
 		stream_upload.data_socket = -1;
@@ -1000,7 +1159,9 @@ int slippi_ftp_stream_data(const void* data, u32 size) {
 	
 	int result = transfer_exact(stream_upload.data_socket, (char*)data, size, 1);
 	if (result < 0) {
-		dbgprintf("FTP Stream: Failed to send data chunk (%d bytes)\r\n", size);
+		dbgprintf("FTP Stream: Failed to send data chunk (%d bytes), marking stream as inactive\r\n", size);
+		// Mark stream as inactive but don't clean up yet - let finish/cancel handle cleanup
+		stream_upload.active = 0;
 		return SLIPPI_FTP_UPLOAD_FAIL;
 	}
 	
@@ -1012,7 +1173,8 @@ int slippi_ftp_stream_data(const void* data, u32 size) {
 int slippi_ftp_finish_stream_upload(void) {
 	extern s32 top_fd;
 	
-	if (!stream_upload.active) {
+	if (!stream_upload.active && stream_upload.data_socket < 0) {
+		// Already finished or never started
 		return SLIPPI_FTP_ERROR;
 	}
 	
@@ -1024,13 +1186,24 @@ int slippi_ftp_finish_stream_upload(void) {
 		stream_upload.data_socket = -1;
 	}
 	
-	// Read final response
-	int response_code = slippi_ftp_read_response(&stream_client);
-	if (response_code != 226) {
-		dbgprintf("FTP Stream: Transfer completion failed with code %d\r\n", response_code);
-		slippi_ftp_disconnect(&stream_client);
-		stream_upload.active = 0;
-		return SLIPPI_FTP_UPLOAD_FAIL;
+	// Only try to read response if we still think we're connected
+	if (stream_client.connected) {
+		// Read final response
+		int response_code = slippi_ftp_read_response(&stream_client);
+		if (response_code == SLIPPI_FTP_ERROR || response_code == SLIPPI_FTP_CONNECT_FAIL) {
+			dbgprintf("FTP Stream: Lost connection while finishing upload\r\n");
+			slippi_ftp_disconnect(&stream_client);
+			stream_upload.active = 0;
+			return SLIPPI_FTP_CONNECT_FAIL;
+		}
+		if (response_code != 226) {
+			dbgprintf("FTP Stream: Transfer completion failed with code %d\r\n", response_code);
+			slippi_ftp_disconnect(&stream_client);
+			stream_upload.active = 0;
+			return SLIPPI_FTP_UPLOAD_FAIL;
+		}
+	} else {
+		dbgprintf("FTP Stream: Connection already lost, skipping final response read\r\n");
 	}
 	
 	// Disconnect from FTP server
