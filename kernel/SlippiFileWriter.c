@@ -236,6 +236,7 @@ static u32 SlippiHandlerThread(void *arg)
 	bool failedToMount = false;
 	bool hasFile = false;
 	const bool use_usb = ConfigGetUseUSB() != 1;
+	bool ftp_enabled = (slippi_settings && slippi_settings->ftp_enabled && ConfigGetConfig(NIN_CFG_NETWORK));
 	bool mounted = use_usb ? USBStorage_IsInserted_SlippiThread() : true;
 
 	while (1)
@@ -243,6 +244,7 @@ static u32 SlippiHandlerThread(void *arg)
 		// Cycle time, look at const definition for more info
 		mdelay(THREAD_CYCLE_TIME_MS);
 
+		bool usb_ready = true;
 		if (use_usb)
 		{
 			if (!USBStorage_IsInserted_SlippiThread())
@@ -250,16 +252,10 @@ static u32 SlippiHandlerThread(void *arg)
 				if (mounted)
 					f_mount_char(NULL, "usb:", 1);
 
-				// Cancel any active FTP streaming upload when USB is removed
-				if (slippi_ftp_is_stream_active()) {
-					dbgprintf("SlippiFileWriter: USB removed, cancelling FTP stream upload\r\n");
-					slippi_ftp_cancel_stream_upload();
-				}
-
 				failedToMount = false;
 				hasFile = false;
 				mounted = false;
-				continue;
+				usb_ready = false;
 			}
 			else if (!mounted && !failedToMount)
 			{
@@ -273,15 +269,17 @@ static u32 SlippiHandlerThread(void *arg)
 				}
 				else
 				{
-					// only attempt to mount once, user can retry by re-inserting the device.
 					failedToMount = true;
 				}
+				usb_ready = mounted;
 			}
-			if (!mounted)
-				continue;
+			else
+			{
+				usb_ready = mounted;
+			}
 		}
 
-		// Read from memory and write to file
+		// Read from memory and write to file or FTP
 		SlpMemError err = SlippiMemoryRead(&reader, readBuf, READ_BUF_SIZE, memReadPos);
 		if (err)
 		{
@@ -301,55 +299,80 @@ static u32 SlippiHandlerThread(void *arg)
 
 		if (reader.lastReadResult.isNewGame)
 		{
-			// Create folder if it doesn't exist yet
-			f_mkdir_secondary_drive("/Slippi");
-
 			gameStartTime = GetCurrentTime();
-
-			dbgprintf("Creating File...\r\n");
 			char *fileName = generateFileName(true);
-			// Maybe can remove FA_READ since network thread doesn't share &currentFile
-			FRESULT fileOpenResult = f_open_secondary_drive(&currentFile, fileName, FA_CREATE_ALWAYS | FA_WRITE | FA_READ);
-			if (fileOpenResult != FR_OK)
-			{
-				dbgprintf("Slippi: failed to open file: %s, errno: %d\r\n", fileName, fileOpenResult);
-				mdelay(LED_FLASH_TIME_MS - THREAD_CYCLE_TIME_MS - 100); // short enough so we can recover with running out of LED time.
-				continue;
-			}
-			if (replaysLED)
-				flashLED();
-
-			hasFile = true;
+			hasFile = false;
 			writtenByteCount = 0;
-			writeHeader(&currentFile);
-			
-			// Start streaming FTP upload if enabled
-			if (slippi_settings && slippi_settings->ftp_enabled && ConfigGetConfig(NIN_CFG_NETWORK)) {
+
+			if (ConfigGetConfig(NIN_CFG_SLIPPI_REPLAYS) && usb_ready)
+			{
+				// Create folder if it doesn't exist yet
+				f_mkdir_secondary_drive("/Slippi");
+
+				dbgprintf("Creating File...\r\n");
+				// Maybe can remove FA_READ since network thread doesn't share &currentFile
+				FRESULT fileOpenResult = f_open_secondary_drive(&currentFile, fileName, FA_CREATE_ALWAYS | FA_WRITE | FA_READ);
+				if (fileOpenResult != FR_OK)
+				{
+					dbgprintf("Slippi: failed to open file: %s, errno: %d\r\n", fileName, fileOpenResult);
+					mdelay(LED_FLASH_TIME_MS - THREAD_CYCLE_TIME_MS - 100); // short enough so we can recover with running out of LED time.
+					continue;
+				}
+				if (replaysLED)
+					flashLED();
+
+				hasFile = true;
+				writeHeader(&currentFile);
+			}
+
+			// FTP streaming is always attempted if enabled, regardless of USB
+			if (ftp_enabled)
+			{
 				// Construct remote path
 				char remote_path[256];
 				const char* filename_only = strrchr(fileName, '/');
-				if (!filename_only) {
+				if (!filename_only)
+				{
 					filename_only = fileName;
-				} else {
+				} else
+				{
 					filename_only++; // Skip the '/'
 				}
-				
-				if (strlen(slippi_settings->ftp_directory) > 0 && strcmp(slippi_settings->ftp_directory, "/") != 0) {
-					_sprintf(remote_path, "%s/%s", slippi_settings->ftp_directory, filename_only);
+
+				// Insert console nickname before .slp extension
+				const char* ext = strrchr(filename_only, '.');
+				char nick[33];
+				strncpy(nick, SlippiGetConsoleNick(), 32);
+				nick[32] = 0;
+				if (ext && strlen(nick) > 0) {
+					int baseLen = ext - filename_only;
+					_sprintf(remote_path, "%.*s.%s%s", baseLen, filename_only, nick, ext);
 				} else {
+					// fallback if no extension or no nick
 					strncpy(remote_path, filename_only, sizeof(remote_path) - 1);
+					remote_path[sizeof(remote_path) - 1] = '\0';
+				}
+
+				// Prepend FTP directory if needed
+				if (strlen(slippi_settings->ftp_directory) > 0 && strcmp(slippi_settings->ftp_directory, "/") != 0)
+				{
+					char tmp_path[256];
+					_sprintf(tmp_path, "%s/%s", slippi_settings->ftp_directory, remote_path);
+					strncpy(remote_path, tmp_path, sizeof(remote_path) - 1);
 					remote_path[sizeof(remote_path) - 1] = '\0';
 				}
 				
 				dbgprintf("SlippiFileWriter: Starting FTP stream upload to %s\r\n", remote_path);
 				int stream_result = slippi_ftp_start_stream_upload(fileName, remote_path);
-				if (stream_result == SLIPPI_FTP_SUCCESS) {
+				if (stream_result == SLIPPI_FTP_SUCCESS)
+				{
 					dbgprintf("SlippiFileWriter: FTP stream upload started successfully\r\n");
 					
-					// Stream the header that was just written
+					// Stream the header that would have been written to file
 					u8 header[] = {'{', 'U', 3, 'r', 'a', 'w', '[', '$', 'U', '#', 'l', 0, 0, 0, 0};
 					slippi_ftp_stream_data(header, sizeof(header));
-				} else {
+				} else
+				{
 					dbgprintf("SlippiFileWriter: Failed to start FTP stream upload (%d)\r\n", stream_result);
 				}
 			}
@@ -364,24 +387,27 @@ static u32 SlippiHandlerThread(void *arg)
 
 		// dbgprintf("Bytes read: %d\r\n", reader.lastReadResult.bytesRead);
 
-		if (!hasFile)
+		UINT wrote = reader.lastReadResult.bytesRead;
+		if (ConfigGetConfig(NIN_CFG_SLIPPI_REPLAYS) && (!use_usb || mounted))
 		{
-			// we can reach this state if the user inserts a usb device during a game.
-			// skip over and don't write anything until we see the start of a new game
-			if (replaysLED)
+			if (!hasFile)
+			{
+				// we can reach this state if the user inserts a usb device during a game.
+				// skip over and don't write anything until we see the start of a new game
+				if (replaysLED)
+					flashLED();
+				memReadPos += wrote;
+				continue;
+			}
+
+			FRESULT writeResult = f_write(&currentFile, readBuf, wrote, &wrote);
+			if (replaysLED && writeResult == FR_OK && wrote > 0)
 				flashLED();
-			memReadPos += reader.lastReadResult.bytesRead;
-			continue;
+			f_sync(&currentFile);
+
+			if (wrote == 0)
+				continue;
 		}
-
-		UINT wrote;
-		FRESULT writeResult = f_write(&currentFile, readBuf, reader.lastReadResult.bytesRead, &wrote);
-		if (replaysLED && writeResult == FR_OK && wrote > 0)
-			flashLED();
-		f_sync(&currentFile);
-
-		if (wrote == 0)
-			continue;
 
 		// Stream data to FTP if upload is active
 		if (slippi_ftp_is_stream_active() && wrote > 0) {
@@ -468,31 +494,32 @@ static u32 SlippiHandlerThread(void *arg)
 						dbgprintf("SlippiFileWriter: FTP stream upload failed to complete (%d)\r\n", stream_result);
 					}
 				}
-				
-				completeFile(&currentFile, &reader, writtenByteCount);
-				
-				// Ensure file is fully synced before closing
-				f_sync(&currentFile);
-				dbgprintf("SlippiHandlerThread: File synced, about to close\r\n");
-				
-				FRESULT closeResult = f_close(&currentFile);
-				hasFile = false;
-				dbgprintf("SlippiHandlerThread: File close result: %d\r\n", closeResult);
-				
-				// Since we're already uploading via streaming, we don't need the post-completion upload
-				// Just verify file accessibility for potential future use
-				dbgprintf("SlippiHandlerThread: Starting file verification process\r\n");
-				char *fileName = generateFileName(false);
-				dbgprintf("SlippiHandlerThread: Verifying file: %s\r\n", fileName);
-				FIL testFile;
-				FRESULT testResult = f_open_secondary_drive(&testFile, fileName, FA_READ);
-				if (testResult == FR_OK) {
-					f_close(&testFile);
-					dbgprintf("SlippiHandlerThread: File verification successful\r\n");
-				} else {
-					dbgprintf("SlippiHandlerThread: File verification failed (%d)\r\n", testResult);
+				if (ConfigGetConfig(NIN_CFG_SLIPPI_REPLAYS) && (!use_usb || mounted))
+				{
+					completeFile(&currentFile, &reader, writtenByteCount);
+					
+					// Ensure file is fully synced before closing
+					f_sync(&currentFile);
+					dbgprintf("SlippiHandlerThread: File synced, about to close\r\n");
+					
+					FRESULT closeResult = f_close(&currentFile);
+					hasFile = false;
+					dbgprintf("SlippiHandlerThread: File close result: %d\r\n", closeResult);
+					
+					// Since we're already uploading via streaming, we don't need the post-completion upload
+					// Just verify file accessibility for potential future use
+					dbgprintf("SlippiHandlerThread: Starting file verification process\r\n");
+					char *fileName = generateFileName(false);
+					dbgprintf("SlippiHandlerThread: Verifying file: %s\r\n", fileName);
+					FIL testFile;
+					FRESULT testResult = f_open_secondary_drive(&testFile, fileName, FA_READ);
+					if (testResult == FR_OK) {
+						f_close(&testFile);
+						dbgprintf("SlippiHandlerThread: File verification successful\r\n");
+					} else {
+						dbgprintf("SlippiHandlerThread: File verification failed (%d)\r\n", testResult);
+					}
 				}
-				
 				writtenByteCount = 0;
 				
 				// Flash LED to indicate completion
