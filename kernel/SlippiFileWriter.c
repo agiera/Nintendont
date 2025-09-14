@@ -55,7 +55,7 @@ void SlippiFileWriterInit(bool led)
 	replaysLED = led;
 
 	// Only initialize FTP system if both network and FTP are enabled
-	if (slippi_settings && slippi_settings->ftp_enabled && ConfigGetConfig(NIN_CFG_NETWORK)) {
+	if (slippi_settings && ConfigGetConfig(NIN_CFG_SLIPPI_FTP) && ConfigGetConfig(NIN_CFG_NETWORK)) {
 		dbgprintf("SlippiFileWriter: Initializing FTP system\r\n");
 		if (slippi_ftp_init() == SLIPPI_FTP_SUCCESS) {
 			dbgprintf("SlippiFileWriter: FTP init successful\r\n");
@@ -65,7 +65,7 @@ void SlippiFileWriterInit(bool led)
 	} else {
 		if (!slippi_settings) {
 			dbgprintf("SlippiFileWriter: No slippi_settings available\r\n");
-		} else if (!slippi_settings->ftp_enabled) {
+		} else if (!ConfigGetConfig(NIN_CFG_SLIPPI_FTP)) {
 			dbgprintf("SlippiFileWriter: FTP disabled in settings\r\n");
 		} else if (!ConfigGetConfig(NIN_CFG_NETWORK)) {
 			dbgprintf("SlippiFileWriter: Network not enabled, skipping FTP init\r\n");
@@ -236,7 +236,7 @@ static u32 SlippiHandlerThread(void *arg)
 	bool failedToMount = false;
 	bool hasFile = false;
 	const bool use_usb = ConfigGetUseUSB() != 1;
-	bool ftp_enabled = (slippi_settings && slippi_settings->ftp_enabled && ConfigGetConfig(NIN_CFG_NETWORK));
+	bool ftp_enabled = (slippi_settings && ConfigGetConfig(NIN_CFG_SLIPPI_FTP) && ConfigGetConfig(NIN_CFG_NETWORK));
 	bool mounted = use_usb ? USBStorage_IsInserted_SlippiThread() : true;
 
 	while (1)
