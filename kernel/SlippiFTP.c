@@ -6,6 +6,7 @@ Based on ftpii FTP implementation
 
 #include "SlippiFTP.h"
 #include "Config.h"
+#include "SlippiMemory.h"
 #include "string.h"
 #include "syscalls.h"
 #include "vsprintf.h"
@@ -17,6 +18,19 @@ Based on ftpii FTP implementation
 #define FTP_BUFFER_SIZE 1024
 #define CRLF "\r\n"
 #define CRLF_LENGTH 2
+
+// Shared memory for CMD 0xA0xx controller metadata (ARM physical)
+#define SFW_EXTRA_DATA_ADDR  0x13080020
+#define SFW_XDATA_STRIDE     0x02B0
+#define SFW_XOFF_NCHUNKS     0x08
+#define SFW_XOFF_CHUNKS      0x10
+#define SFW_CHUNK_SIZE       80
+#define SFW_CHUNK_DATA       78
+
+#define FTP_METADATA_PLAYER_BUF 1024
+#define FTP_METADATA_UBJ_BUF 2300
+#define FTP_METADATA_HEX_BUF (FTP_METADATA_UBJ_BUF * 2 + 1)
+#define FTP_SITE_CMD_BUF (FTP_METADATA_HEX_BUF + 32)
 
 // Simple implementations for missing string functions
 static char* strrchr_impl(const char* str, int c) {
@@ -43,6 +57,8 @@ static int ftp_initialized = 0;
 // Streaming upload state
 static slippi_ftp_stream_t stream_upload;
 static slippi_ftp_client_t stream_client;
+// Large SITE metadata commands can exceed 256 bytes; keep command buffer in BSS.
+static char ftp_command_buffer[FTP_SITE_CMD_BUF + CRLF_LENGTH + 1];
 
 // Function prototypes for internal functions
 static int slippi_ftp_connect(slippi_ftp_client_t* client, const char* server, unsigned short port);
@@ -53,6 +69,11 @@ static int slippi_ftp_send_command(slippi_ftp_client_t* client, const char* comm
 static void slippi_ftp_disconnect(slippi_ftp_client_t* client);
 static int transfer_exact(int socket, char *buf, int length, int is_send);
 static int send_from_file(int data_socket, const char* filepath);
+static int slippi_ftp_send_stream_metadata_ubjson(slippi_ftp_client_t* client);
+static u16 reassembleControllerMetadata(u32 chanBase, u8 *dest, u16 maxLen);
+static u16 validateUbjsonStringDict(const u8 *buf, u16 len);
+static int build_stream_metadata_ubjson(u8* out, u16 out_len);
+static void bytes_to_hex(const u8* src, u16 len, char* dest);
 
 // Initialize FTP client system
 int slippi_ftp_init(void) {
@@ -237,6 +258,162 @@ static int send_from_file(int data_socket, const char* filepath) {
 	} else {
 		return send_result;
 	}
+}
+
+/* Validate UBJSON object containing only string key/value pairs.
+ * Returns validated byte count (including { and }), or 0 on failure. */
+static u16 validateUbjsonStringDict(const u8 *buf, u16 len)
+{
+	if (len < 2 || buf[0] != '{')
+		return 0;
+
+	u16 pos = 1;
+	while (pos < len && buf[pos] != '}')
+	{
+		u16 i;
+		if (pos + 2 > len || (buf[pos] != 'U' && buf[pos] != 'i'))
+			return 0;
+		u8 keyLen = buf[pos + 1];
+		pos += 2;
+		if (keyLen == 0 || pos + keyLen > len)
+			return 0;
+		for (i = 0; i < keyLen; i++)
+			if (buf[pos + i] < 0x20 || buf[pos + i] > 0x7E)
+				return 0;
+		pos += keyLen;
+
+		if (pos + 3 > len || buf[pos] != 'S' ||
+		    (buf[pos + 1] != 'U' && buf[pos + 1] != 'i'))
+			return 0;
+		u8 valLen = buf[pos + 2];
+		pos += 3;
+		if (pos + valLen > len)
+			return 0;
+		for (i = 0; i < valLen; i++)
+			if (buf[pos + i] < 0x20 || buf[pos + i] > 0x7E)
+				return 0;
+		pos += valLen;
+	}
+
+	if (pos >= len || buf[pos] != '}')
+		return 0;
+
+	return pos + 1;
+}
+
+/* Reassemble data from raw 80-byte SI chunks into contiguous buffer. */
+static u16 reassembleControllerMetadata(u32 chanBase, u8 *dest, u16 maxLen)
+{
+	u32 nChunks  = read32(chanBase + SFW_XOFF_NCHUNKS);
+
+	if (nChunks == 0 || nChunks > 8)
+		return 0;
+
+	u16 written = 0;
+	u32 i;
+	for (i = 0; i < nChunks && written < maxLen; i++)
+	{
+		u8 *chunkN = (u8*)(chanBase + SFW_XOFF_CHUNKS + i * SFW_CHUNK_SIZE);
+		u16 copyLen = SFW_CHUNK_DATA;
+		if (written + copyLen > maxLen)
+			copyLen = maxLen - written;
+		memcpy(dest + written, chunkN + 2, copyLen);
+		written += copyLen;
+	}
+
+	return written;
+}
+
+static int build_stream_metadata_ubjson(u8* out, u16 out_len)
+{
+	u16 writePos = 0;
+	int ch;
+	static u8 playerBuf[FTP_METADATA_PLAYER_BUF];
+
+	if (!out || out_len < 2)
+		return 0;
+
+	out[writePos++] = '{';
+
+	/* Ensure coherent read from shared metadata memory. */
+	sync_before_read((void*)SFW_EXTRA_DATA_ADDR, 4 * SFW_XDATA_STRIDE);
+
+	for (ch = 0; ch < 4; ch++)
+	{
+		u32 addr = SFW_EXTRA_DATA_ADDR + ch * SFW_XDATA_STRIDE;
+		u32 calls = read32(addr + 0x04);
+		if (calls == 0)
+			continue;
+
+		u32 tag = read32(addr + 0x00);
+		if (tag != 0xCA110000)
+			continue;
+
+		u16 dataLen = reassembleControllerMetadata(addr, playerBuf, sizeof(playerBuf));
+		u16 validLen = validateUbjsonStringDict(playerBuf, dataLen);
+		if (validLen == 0)
+			continue;
+
+		if (writePos + 3 + validLen + 1 > out_len)
+			break;
+
+		out[writePos++] = 'U';
+		out[writePos++] = 1;
+		out[writePos++] = '0' + ch;
+		memcpy(&out[writePos], playerBuf, validLen);
+		writePos += validLen;
+	}
+
+	out[writePos++] = '}';
+	return writePos;
+}
+
+static void bytes_to_hex(const u8* src, u16 len, char* dest)
+{
+	static const char hexdigits[] = "0123456789abcdef";
+	u16 i;
+	for (i = 0; i < len; i++)
+	{
+		dest[i * 2] = hexdigits[(src[i] >> 4) & 0x0F];
+		dest[i * 2 + 1] = hexdigits[src[i] & 0x0F];
+	}
+	dest[len * 2] = '\0';
+}
+
+static int slippi_ftp_send_stream_metadata_ubjson(slippi_ftp_client_t* client)
+{
+	if (!client || !client->connected || !client->authenticated)
+		return SLIPPI_FTP_ERROR;
+
+	u8 ubjPayload[FTP_METADATA_UBJ_BUF];
+	char hexPayload[FTP_METADATA_HEX_BUF];
+	char siteCmd[FTP_SITE_CMD_BUF];
+
+	int ubjLen = build_stream_metadata_ubjson(ubjPayload, sizeof(ubjPayload));
+	if (ubjLen <= 2)
+	{
+		dbgprintf("FTP: No controller metadata available for SITE SLPMETAUBJ\r\n");
+		return SLIPPI_FTP_SUCCESS;
+	}
+
+	bytes_to_hex(ubjPayload, (u16)ubjLen, hexPayload);
+	_sprintf(siteCmd, "SITE SLPMETAUBJ %s", hexPayload);
+
+	int send_result = slippi_ftp_send_command(client, siteCmd);
+	if (send_result != SLIPPI_FTP_SUCCESS)
+		return send_result;
+
+	int response_code = slippi_ftp_read_response(client);
+	if (response_code == SLIPPI_FTP_ERROR || response_code == SLIPPI_FTP_CONNECT_FAIL)
+		return SLIPPI_FTP_CONNECT_FAIL;
+	if (response_code != 200)
+	{
+		dbgprintf("FTP: SITE SLPMETAUBJ failed with code %d\r\n", response_code);
+		return SLIPPI_FTP_UPLOAD_FAIL;
+	}
+
+	dbgprintf("FTP: Applied SITE SLPMETAUBJ metadata override\r\n");
+	return SLIPPI_FTP_SUCCESS;
 }
 // Authenticate with FTP server
 static int slippi_ftp_authenticate(slippi_ftp_client_t* client, const char* username, const char* password) {
@@ -694,18 +871,18 @@ static int slippi_ftp_send_command(slippi_ftp_client_t* client, const char* comm
 	}
 	
 	// Construct command with CRLF
-	char cmd_buffer[256];
 	int cmd_len = strlen(command);
-	if (cmd_len > sizeof(cmd_buffer) - CRLF_LENGTH - 1) {
+	if (cmd_len > sizeof(ftp_command_buffer) - CRLF_LENGTH - 1) {
+		dbgprintf("FTP: Command too long (%d bytes): %s\r\n", cmd_len, command);
 		return SLIPPI_FTP_ERROR;
 	}
 	
-	strcpy(cmd_buffer, command);
-	strcat_impl(cmd_buffer, CRLF);
+	strcpy(ftp_command_buffer, command);
+	strcat_impl(ftp_command_buffer, CRLF);
 	
 	// Send command using transfer_exact approach from ftpii
 	int total_len = cmd_len + CRLF_LENGTH;
-	int result = transfer_exact(client->socket, cmd_buffer, total_len, 1);
+	int result = transfer_exact(client->socket, ftp_command_buffer, total_len, 1);
 	
 	if (result < 0) {
 		dbgprintf("FTP: Failed to send command: %s (connection may be lost)\r\n", command);
@@ -783,6 +960,16 @@ int slippi_ftp_start_stream_upload(const char* local_path, const char* remote_pa
 	if (slippi_ftp_authenticate(&stream_client, slippi_settings->ftp_username, slippi_settings->ftp_password) != SLIPPI_FTP_SUCCESS) {
 		slippi_ftp_disconnect(&stream_client);
 		return SLIPPI_FTP_AUTH_FAIL;
+	}
+
+	// Send player metadata override (UBJSON object encoded as hex) if present.
+	int meta_result = slippi_ftp_send_stream_metadata_ubjson(&stream_client);
+	if (meta_result != SLIPPI_FTP_SUCCESS) {
+		slippi_ftp_disconnect(&stream_client);
+		if (meta_result == SLIPPI_FTP_CONNECT_FAIL) {
+			return SLIPPI_FTP_CONNECT_FAIL;
+		}
+		return SLIPPI_FTP_UPLOAD_FAIL;
 	}
 	
 	// Set binary mode
