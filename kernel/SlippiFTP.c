@@ -30,7 +30,8 @@ Based on ftpii FTP implementation
 #define FTP_METADATA_PLAYER_BUF 1024
 #define FTP_METADATA_UBJ_BUF 2300
 #define FTP_METADATA_HEX_BUF (FTP_METADATA_UBJ_BUF * 2 + 1)
-#define FTP_SITE_CMD_BUF (FTP_METADATA_HEX_BUF + 32)
+#define FTP_METADATA_JSON_BUF (FTP_METADATA_HEX_BUF + 64)
+#define FTP_METADATA_LOCAL_PATH "/Slippi/.slpmeta_upload.json"
 
 // Simple implementations for missing string functions
 static char* strrchr_impl(const char* str, int c) {
@@ -57,8 +58,6 @@ static int ftp_initialized = 0;
 // Streaming upload state
 static slippi_ftp_stream_t stream_upload;
 static slippi_ftp_client_t stream_client;
-// Large SITE metadata commands can exceed 256 bytes; keep command buffer in BSS.
-static char ftp_command_buffer[FTP_SITE_CMD_BUF + CRLF_LENGTH + 1];
 
 // Function prototypes for internal functions
 static int slippi_ftp_connect(slippi_ftp_client_t* client, const char* server, unsigned short port);
@@ -69,7 +68,7 @@ static int slippi_ftp_send_command(slippi_ftp_client_t* client, const char* comm
 static void slippi_ftp_disconnect(slippi_ftp_client_t* client);
 static int transfer_exact(int socket, char *buf, int length, int is_send);
 static int send_from_file(int data_socket, const char* filepath);
-static int slippi_ftp_send_stream_metadata_ubjson(slippi_ftp_client_t* client);
+static int slippi_ftp_upload_stream_metadata_sidecar(slippi_ftp_client_t* client, const char* remote_replay_path);
 static u16 reassembleControllerMetadata(u32 chanBase, u8 *dest, u16 maxLen);
 static u16 validateUbjsonStringDict(const u8 *buf, u16 len);
 static int build_stream_metadata_ubjson(u8* out, u16 out_len);
@@ -380,40 +379,115 @@ static void bytes_to_hex(const u8* src, u16 len, char* dest)
 	dest[len * 2] = '\0';
 }
 
-static int slippi_ftp_send_stream_metadata_ubjson(slippi_ftp_client_t* client)
+static int parse_ipv4_literal(const char* server, u32* out_ip)
 {
-	if (!client || !client->connected || !client->authenticated)
+	if (!server || !out_ip)
+		return 0;
+
+	int h1 = 0, h2 = 0, h3 = 0, h4 = 0;
+	const char* p = server;
+
+	while (*p >= '0' && *p <= '9') h1 = h1 * 10 + (*p++ - '0');
+	if (*p++ != '.') return 0;
+	while (*p >= '0' && *p <= '9') h2 = h2 * 10 + (*p++ - '0');
+	if (*p++ != '.') return 0;
+	while (*p >= '0' && *p <= '9') h3 = h3 * 10 + (*p++ - '0');
+	if (*p++ != '.') return 0;
+	while (*p >= '0' && *p <= '9') h4 = h4 * 10 + (*p++ - '0');
+	if (*p != '\0') return 0;
+
+	if (h1 > 255 || h2 > 255 || h3 > 255 || h4 > 255)
+		return 0;
+
+	*out_ip = (h1 << 24) | (h2 << 16) | (h3 << 8) | h4;
+	return 1;
+}
+
+static int slippi_ftp_upload_stream_metadata_sidecar(slippi_ftp_client_t* client, const char* remote_replay_path)
+{
+	if (!client || !client->connected || !client->authenticated || !remote_replay_path)
 		return SLIPPI_FTP_ERROR;
 
 	u8 ubjPayload[FTP_METADATA_UBJ_BUF];
 	char hexPayload[FTP_METADATA_HEX_BUF];
-	char siteCmd[FTP_SITE_CMD_BUF];
+	char jsonPayload[FTP_METADATA_JSON_BUF];
+	char remoteMetaPath[320];
 
 	int ubjLen = build_stream_metadata_ubjson(ubjPayload, sizeof(ubjPayload));
 	if (ubjLen <= 2)
 	{
-		dbgprintf("FTP: No controller metadata available for SITE SLPMETAUBJ\r\n");
+		dbgprintf("FTP: No controller metadata available for metadata sidecar\r\n");
 		return SLIPPI_FTP_SUCCESS;
 	}
 
 	bytes_to_hex(ubjPayload, (u16)ubjLen, hexPayload);
-	_sprintf(siteCmd, "SITE SLPMETAUBJ %s", hexPayload);
+	_sprintf(jsonPayload, "{\"ubjson_hex\":\"%s\"}", hexPayload);
 
-	int send_result = slippi_ftp_send_command(client, siteCmd);
-	if (send_result != SLIPPI_FTP_SUCCESS)
-		return send_result;
-
-	int response_code = slippi_ftp_read_response(client);
-	if (response_code == SLIPPI_FTP_ERROR || response_code == SLIPPI_FTP_CONNECT_FAIL)
-		return SLIPPI_FTP_CONNECT_FAIL;
-	if (response_code != 200)
+	if (strlen(remote_replay_path) + strlen(".meta.json") + 1 >= sizeof(remoteMetaPath))
 	{
-		dbgprintf("FTP: SITE SLPMETAUBJ failed with code %d\r\n", response_code);
-		return SLIPPI_FTP_UPLOAD_FAIL;
+		dbgprintf("FTP: Remote metadata path too long, skipping metadata sidecar\r\n");
+		return SLIPPI_FTP_SUCCESS;
+	}
+	_sprintf(remoteMetaPath, "%s.meta.json", remote_replay_path);
+
+	FIL metaFile;
+	UINT wrote = 0;
+	FRESULT openResult = f_open_secondary_drive(&metaFile, FTP_METADATA_LOCAL_PATH, FA_CREATE_ALWAYS | FA_WRITE);
+	if (openResult != FR_OK)
+	{
+		dbgprintf("FTP: Failed to create local metadata sidecar (%d)\r\n", openResult);
+		return SLIPPI_FTP_SUCCESS;
 	}
 
-	dbgprintf("FTP: Applied SITE SLPMETAUBJ metadata override\r\n");
+	UINT jsonLen = strlen(jsonPayload);
+	FRESULT writeResult = f_write(&metaFile, jsonPayload, jsonLen, &wrote);
+	f_close(&metaFile);
+	if (writeResult != FR_OK || wrote != jsonLen)
+	{
+		dbgprintf("FTP: Failed to write local metadata sidecar (%d, wrote=%d/%d)\r\n", writeResult, wrote, jsonLen);
+		return SLIPPI_FTP_SUCCESS;
+	}
+
+	int uploadResult = slippi_ftp_upload_file(client, FTP_METADATA_LOCAL_PATH, remoteMetaPath);
+	if (uploadResult != SLIPPI_FTP_SUCCESS)
+	{
+		dbgprintf("FTP: Failed to upload metadata sidecar (%d)\r\n", uploadResult);
+		if (uploadResult == SLIPPI_FTP_CONNECT_FAIL)
+			return uploadResult;
+		return SLIPPI_FTP_SUCCESS;
+	}
+
+	dbgprintf("FTP: Uploaded metadata sidecar to %s\r\n", remoteMetaPath);
 	return SLIPPI_FTP_SUCCESS;
+}
+
+// Send the metadata sidecar over its own short-lived FTP connection. This lets
+// callers defer the sidecar until controller metadata is actually available
+// (the live replay stream is using stream_client, so we open a separate one).
+int slippi_ftp_send_metadata_sidecar_now(const char* remote_replay_path)
+{
+	extern s32 top_fd;
+
+	if (!ftp_initialized || !slippi_settings || !slippi_settings->ftp_enabled)
+		return SLIPPI_FTP_ERROR;
+	if (!remote_replay_path || remote_replay_path[0] == '\0')
+		return SLIPPI_FTP_ERROR;
+	if (top_fd < 0)
+		return SLIPPI_FTP_CONNECT_FAIL;
+
+	slippi_ftp_client_t meta_client;
+	if (slippi_ftp_connect(&meta_client, slippi_settings->ftp_server, slippi_settings->ftp_port) != SLIPPI_FTP_SUCCESS)
+		return SLIPPI_FTP_CONNECT_FAIL;
+
+	if (slippi_ftp_authenticate(&meta_client, slippi_settings->ftp_username, slippi_settings->ftp_password) != SLIPPI_FTP_SUCCESS)
+	{
+		slippi_ftp_disconnect(&meta_client);
+		return SLIPPI_FTP_AUTH_FAIL;
+	}
+
+	int result = slippi_ftp_upload_stream_metadata_sidecar(&meta_client, remote_replay_path);
+	slippi_ftp_disconnect(&meta_client);
+	return result;
 }
 // Authenticate with FTP server
 static int slippi_ftp_authenticate(slippi_ftp_client_t* client, const char* username, const char* password) {
@@ -622,9 +696,18 @@ pasv_success:
 	dbgprintf("FTP: Connecting to data port %d.%d.%d.%d:%d\r\n", h1, h2, h3, h4, data_port);
 	s32 data_connect_result = connect(top_fd, data_socket, (struct sockaddr*)&data_addr);
 	if (data_connect_result < 0) {
-		dbgprintf("FTP: Failed to connect to data port (error %d)\r\n", data_connect_result);
-		close(top_fd, data_socket);
-		return SLIPPI_FTP_UPLOAD_FAIL;
+		dbgprintf("FTP: Failed to connect to PASV data port (error %d), trying server IP fallback\r\n", data_connect_result);
+		u32 fallback_ip = 0;
+		if (parse_ipv4_literal(slippi_settings->ftp_server, &fallback_ip)) {
+			memcpy(&data_addr.sin_addr, &fallback_ip, sizeof(fallback_ip));
+			data_connect_result = connect(top_fd, data_socket, (struct sockaddr*)&data_addr);
+		}
+		if (data_connect_result < 0) {
+			dbgprintf("FTP: Failed to connect to fallback data port (error %d)\r\n", data_connect_result);
+			close(top_fd, data_socket);
+			return SLIPPI_FTP_UPLOAD_FAIL;
+		}
+		dbgprintf("FTP: Data connection established via server IP fallback\r\n");
 	}
 	dbgprintf("FTP: Data connection established\r\n");
 	
@@ -643,7 +726,7 @@ pasv_success:
 		return SLIPPI_FTP_UPLOAD_FAIL;
 	}
 	
-	// Read initial response (should be 150 "Opening data connection")
+	// Read initial response (150 or 125 are both valid preliminary replies)
 	dbgprintf("FTP: Reading STOR response\r\n");
 	response_code = slippi_ftp_read_response(client);
 	dbgprintf("FTP: STOR response code: %d\r\n", response_code);
@@ -652,7 +735,7 @@ pasv_success:
 		close(top_fd, data_socket);
 		return SLIPPI_FTP_CONNECT_FAIL;
 	}
-	if (response_code != 150) {
+	if (response_code != 150 && response_code != 125) {
 		dbgprintf("FTP: STOR command failed with code %d\r\n", response_code);
 		close(top_fd, data_socket);
 		return SLIPPI_FTP_UPLOAD_FAIL;
@@ -872,18 +955,17 @@ static int slippi_ftp_send_command(slippi_ftp_client_t* client, const char* comm
 	
 	// Construct command with CRLF
 	int cmd_len = strlen(command);
-	if (cmd_len > sizeof(ftp_command_buffer) - CRLF_LENGTH - 1) {
-		dbgprintf("FTP: Command too long (%d bytes): %s\r\n", cmd_len, command);
+	char cmd_buffer[256];
+	if (cmd_len > sizeof(cmd_buffer) - CRLF_LENGTH - 1) {
 		return SLIPPI_FTP_ERROR;
 	}
-	
-	strcpy(ftp_command_buffer, command);
-	strcat_impl(ftp_command_buffer, CRLF);
-	
+
+	strcpy(cmd_buffer, command);
+	strcat_impl(cmd_buffer, CRLF);
+
 	// Send command using transfer_exact approach from ftpii
 	int total_len = cmd_len + CRLF_LENGTH;
-	int result = transfer_exact(client->socket, ftp_command_buffer, total_len, 1);
-	
+	int result = transfer_exact(client->socket, cmd_buffer, total_len, 1);
 	if (result < 0) {
 		dbgprintf("FTP: Failed to send command: %s (connection may be lost)\r\n", command);
 		// Mark connection as lost
@@ -962,16 +1044,12 @@ int slippi_ftp_start_stream_upload(const char* local_path, const char* remote_pa
 		return SLIPPI_FTP_AUTH_FAIL;
 	}
 
-	// Send player metadata override (UBJSON object encoded as hex) if present.
-	int meta_result = slippi_ftp_send_stream_metadata_ubjson(&stream_client);
-	if (meta_result != SLIPPI_FTP_SUCCESS) {
-		slippi_ftp_disconnect(&stream_client);
-		if (meta_result == SLIPPI_FTP_CONNECT_FAIL) {
-			return SLIPPI_FTP_CONNECT_FAIL;
-		}
-		return SLIPPI_FTP_UPLOAD_FAIL;
-	}
-	
+	// NOTE: The per-game metadata sidecar is NOT sent here. At stream start the
+	// controller metadata (0xCA110000 shared memory) has not been populated yet
+	// by the SI get-origin handshake, so it would be empty. The sidecar is
+	// deferred and sent once the metadata becomes available during the game
+	// (see slippi_ftp_send_metadata_sidecar_now in the streaming loop).
+
 	// Set binary mode
 	int send_result = slippi_ftp_send_command(&stream_client, "TYPE I");
 	if (send_result != SLIPPI_FTP_SUCCESS) {
@@ -1064,40 +1142,51 @@ stream_pasv_success:
 	memcpy(&data_addr.sin_addr, &data_ip, sizeof(data_ip));
 	
 	if (connect(top_fd, stream_upload.data_socket, (struct sockaddr*)&data_addr) < 0) {
+		u32 fallback_ip = 0;
+		if (parse_ipv4_literal(slippi_settings->ftp_server, &fallback_ip)) {
+			memcpy(&data_addr.sin_addr, &fallback_ip, sizeof(fallback_ip));
+			if (connect(top_fd, stream_upload.data_socket, (struct sockaddr*)&data_addr) == 0) {
+				dbgprintf("FTP Stream: Data connection established via server IP fallback\r\n");
+				goto stream_data_connect_success;
+			}
+		}
 		close(top_fd, stream_upload.data_socket);
 		stream_upload.data_socket = -1;
 		slippi_ftp_disconnect(&stream_client);
 		return SLIPPI_FTP_UPLOAD_FAIL;
 	}
-	
-	// Send STOR command
-	char stor_cmd[256];
-	_sprintf(stor_cmd, "STOR %s", remote_path);
-	
-	send_result = slippi_ftp_send_command(&stream_client, stor_cmd);
-	if (send_result != SLIPPI_FTP_SUCCESS) {
-		close(top_fd, stream_upload.data_socket);
-		stream_upload.data_socket = -1;
-		slippi_ftp_disconnect(&stream_client);
-		if (send_result == SLIPPI_FTP_CONNECT_FAIL) {
+
+stream_data_connect_success:
+	{
+		// Send STOR command
+		char stor_cmd[256];
+		_sprintf(stor_cmd, "STOR %s", remote_path);
+		
+		send_result = slippi_ftp_send_command(&stream_client, stor_cmd);
+		if (send_result != SLIPPI_FTP_SUCCESS) {
+			close(top_fd, stream_upload.data_socket);
+			stream_upload.data_socket = -1;
+			slippi_ftp_disconnect(&stream_client);
+			if (send_result == SLIPPI_FTP_CONNECT_FAIL) {
+				return SLIPPI_FTP_CONNECT_FAIL;
+			}
+			return SLIPPI_FTP_UPLOAD_FAIL;
+		}
+		
+		// Read initial response (150 or 125 are both valid preliminary replies)
+		response_code = slippi_ftp_read_response(&stream_client);
+		if (response_code == SLIPPI_FTP_ERROR || response_code == SLIPPI_FTP_CONNECT_FAIL) {
+			close(top_fd, stream_upload.data_socket);
+			stream_upload.data_socket = -1;
+			slippi_ftp_disconnect(&stream_client);
 			return SLIPPI_FTP_CONNECT_FAIL;
 		}
-		return SLIPPI_FTP_UPLOAD_FAIL;
-	}
-	
-	// Read initial response
-	response_code = slippi_ftp_read_response(&stream_client);
-	if (response_code == SLIPPI_FTP_ERROR || response_code == SLIPPI_FTP_CONNECT_FAIL) {
-		close(top_fd, stream_upload.data_socket);
-		stream_upload.data_socket = -1;
-		slippi_ftp_disconnect(&stream_client);
-		return SLIPPI_FTP_CONNECT_FAIL;
-	}
-	if (response_code != 150) {
-		close(top_fd, stream_upload.data_socket);
-		stream_upload.data_socket = -1;
-		slippi_ftp_disconnect(&stream_client);
-		return SLIPPI_FTP_UPLOAD_FAIL;
+		if (response_code != 150 && response_code != 125) {
+			close(top_fd, stream_upload.data_socket);
+			stream_upload.data_socket = -1;
+			slippi_ftp_disconnect(&stream_client);
+			return SLIPPI_FTP_UPLOAD_FAIL;
+		}
 	}
 	
 	// Initialize stream state
@@ -1196,4 +1285,41 @@ void slippi_ftp_cancel_stream_upload(void) {
 // Check if streaming upload is active
 int slippi_ftp_is_stream_active(void) {
 	return stream_upload.active;
+}
+
+int slippi_ftp_upload_replay_file(const char* local_path, const char* remote_path) {
+	if (!ftp_initialized || !slippi_settings || !slippi_settings->ftp_enabled) {
+		return SLIPPI_FTP_ERROR;
+	}
+	if (!local_path || !remote_path || !*local_path || !*remote_path) {
+		return SLIPPI_FTP_ERROR;
+	}
+
+	// Ensure any stale stream state is cleared before one-shot upload.
+	if (stream_upload.active) {
+		slippi_ftp_cancel_stream_upload();
+	}
+
+	slippi_ftp_client_t client;
+	memset(&client, 0, sizeof(client));
+	client.socket = -1;
+
+	int result = slippi_ftp_connect(&client, slippi_settings->ftp_server, slippi_settings->ftp_port);
+	if (result != SLIPPI_FTP_SUCCESS) {
+		return result;
+	}
+
+	result = slippi_ftp_authenticate(&client, slippi_settings->ftp_username, slippi_settings->ftp_password);
+	if (result != SLIPPI_FTP_SUCCESS) {
+		slippi_ftp_disconnect(&client);
+		return result;
+	}
+
+	result = slippi_ftp_upload_stream_metadata_sidecar(&client, remote_path);
+	if (result == SLIPPI_FTP_SUCCESS) {
+		result = slippi_ftp_upload_file(&client, local_path, remote_path);
+	}
+
+	slippi_ftp_disconnect(&client);
+	return result;
 }

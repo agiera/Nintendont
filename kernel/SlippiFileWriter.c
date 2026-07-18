@@ -235,9 +235,11 @@ static u16 reassembleControllerMetadata(u32 chanBase, u8 *dest, u16 maxLen)
 	return written;
 }
 
-void completeFile(FIL *file, SlpGameReader *reader, u32 writtenByteCount)
+// Build the complete Slippi footer (metadata block) into `footer`, including the
+// per-port controller metadata read from shared memory. Single source of truth so
+// the local (USB/SD) write and the streamed FTP upload emit identical footers.
+static u32 buildSlpFooter(u8 *footer, SlpGameReader *reader)
 {
-	static u8 footer[FOOTER_BUFFER_LENGTH];
 	u32 writePos = 0;
 
 	// Write opener
@@ -333,6 +335,14 @@ void completeFile(FIL *file, SlpGameReader *reader, u32 writtenByteCount)
 	memcpy(&footer[writePos], closing, writeLen);
 	writePos += writeLen;
 
+	return writePos;
+}
+
+void completeFile(FIL *file, SlpGameReader *reader, u32 writtenByteCount)
+{
+	static u8 footer[FOOTER_BUFFER_LENGTH];
+	u32 writePos = buildSlpFooter(footer, reader);
+
 	// Write footer
 	u32 wrote;
 	f_write(file, footer, writePos, &wrote);
@@ -341,6 +351,24 @@ void completeFile(FIL *file, SlpGameReader *reader, u32 writtenByteCount)
 	f_lseek(file, 11);
 	f_write(file, &writtenByteCount, 4, &wrote);
 	f_sync(file);
+}
+
+// Returns true once at least one channel has valid controller metadata in shared
+// memory (populated by the SI get-origin handshake during controller polling).
+// Used to defer the FTP metadata sidecar until the data actually exists.
+static bool controllerMetadataAvailable(void)
+{
+	sync_before_read((void*)SFW_EXTRA_DATA_ADDR, 4 * SFW_XDATA_STRIDE);
+	int ch;
+	for (ch = 0; ch < 4; ch++)
+	{
+		u32 addr = SFW_EXTRA_DATA_ADDR + ch * SFW_XDATA_STRIDE;
+		if (read32(addr + 0x04) == 0)
+			continue;
+		if (read32(addr + 0x00) == 0xCA110000)
+			return true;
+	}
+	return false;
 }
 
 static u32 SlippiHandlerThread(void *arg)
@@ -352,6 +380,10 @@ static u32 SlippiHandlerThread(void *arg)
 	static u64 memReadPos = 0;
 
 	u32 writtenByteCount = 0;
+	bool ftp_streaming_this_game = false;
+	bool ftp_sidecar_sent = false;
+	char ftp_remote_path[256];
+	ftp_remote_path[0] = '\0';
 	driveTimer = read32(HW_TIMER);
 	driveTimerSet = false;
 
@@ -425,6 +457,9 @@ static u32 SlippiHandlerThread(void *arg)
 			char *fileName = generateFileName(true);
 			hasFile = false;
 			writtenByteCount = 0;
+			ftp_streaming_this_game = false;
+			ftp_sidecar_sent = false;
+			ftp_remote_path[0] = '\0';
 
 			if (ConfigGetConfig(NIN_CFG_SLIPPI_REPLAYS) && usb_ready)
 			{
@@ -484,18 +519,28 @@ static u32 SlippiHandlerThread(void *arg)
 					remote_path[sizeof(remote_path) - 1] = '\0';
 				}
 				
-				dbgprintf("SlippiFileWriter: Starting FTP stream upload to %s\r\n", remote_path);
-				int stream_result = slippi_ftp_start_stream_upload(fileName, remote_path);
-				if (stream_result == SLIPPI_FTP_SUCCESS)
-				{
-					dbgprintf("SlippiFileWriter: FTP stream upload started successfully\r\n");
-					
-					// Stream the header that would have been written to file
-					u8 header[] = {'{', 'U', 3, 'r', 'a', 'w', '[', '$', 'U', '#', 'l', 0, 0, 0, 0};
-					slippi_ftp_stream_data(header, sizeof(header));
-				} else
-				{
-					dbgprintf("SlippiFileWriter: Failed to start FTP stream upload (%d)\r\n", stream_result);
+				strncpy(ftp_remote_path, remote_path, sizeof(ftp_remote_path) - 1);
+				ftp_remote_path[sizeof(ftp_remote_path) - 1] = '\0';
+
+				// Prefer finalized one-shot upload when we can write locally, so raw_len is patched.
+				if (!(ConfigGetConfig(NIN_CFG_SLIPPI_REPLAYS) && usb_ready)) {
+					dbgprintf("SlippiFileWriter: Local replay unavailable, falling back to FTP streaming (%s)\r\n", remote_path);
+					int stream_result = slippi_ftp_start_stream_upload(fileName, remote_path);
+					if (stream_result == SLIPPI_FTP_SUCCESS)
+					{
+						ftp_streaming_this_game = true;
+						dbgprintf("SlippiFileWriter: FTP stream upload started successfully\r\n");
+						
+						// Stream the header that would have been written to file
+						u8 header[] = {'{', 'U', 3, 'r', 'a', 'w', '[', '$', 'U', '#', 'l', 0, 0, 0, 0};
+						slippi_ftp_stream_data(header, sizeof(header));
+					}
+					else
+					{
+						dbgprintf("SlippiFileWriter: Failed to start FTP stream upload (%d)\r\n", stream_result);
+					}
+				} else {
+					dbgprintf("SlippiFileWriter: Deferring FTP upload until finalized file is complete (%s)\r\n", remote_path);
 				}
 			}
 		}
@@ -532,11 +577,26 @@ static u32 SlippiHandlerThread(void *arg)
 		}
 
 		// Stream data to FTP if upload is active
-		if (slippi_ftp_is_stream_active() && wrote > 0) {
+		if (ftp_streaming_this_game && slippi_ftp_is_stream_active() && wrote > 0) {
 			int stream_result = slippi_ftp_stream_data(readBuf, wrote);
 			if (stream_result != SLIPPI_FTP_SUCCESS) {
 				dbgprintf("SlippiFileWriter: FTP stream data failed, cancelling upload\r\n");
 				slippi_ftp_cancel_stream_upload();
+			}
+		}
+
+		// Deferred metadata sidecar: the controller metadata handshake populates
+		// shared memory during the game (not at stream start), so send the sidecar
+		// exactly once, as soon as the metadata first becomes available, over its
+		// own short-lived FTP connection (the stream connection is busy).
+		if (ftp_streaming_this_game && !ftp_sidecar_sent && ftp_remote_path[0] != '\0'
+		    && controllerMetadataAvailable()) {
+			int meta_result = slippi_ftp_send_metadata_sidecar_now(ftp_remote_path);
+			if (meta_result == SLIPPI_FTP_SUCCESS) {
+				ftp_sidecar_sent = true;
+				dbgprintf("SlippiFileWriter: Sent deferred metadata sidecar for %s\r\n", ftp_remote_path);
+			} else {
+				dbgprintf("SlippiFileWriter: Deferred metadata sidecar send failed (%d), will retry\r\n", meta_result);
 			}
 		}
 
@@ -550,61 +610,13 @@ static u32 SlippiHandlerThread(void *arg)
 			if (writtenByteCount > 0) {
 				dbgprintf("SlippiHandlerThread: Completing file with %d bytes written\r\n", writtenByteCount);
 				
-				// Complete the file footer
+				// Complete the file footer using the same builder as completeFile
+				// (USB/local write) so the streamed upload includes controller metadata.
 				u8 footer[FOOTER_BUFFER_LENGTH];
-				u32 writePos = 0;
-
-				// Write opener
-				u8 footerOpener[] = {'U', 8, 'm', 'e', 't', 'a', 'd', 'a', 't', 'a', '{'};
-				u8 writeLen = sizeof(footerOpener);
-				memcpy(&footer[writePos], footerOpener, writeLen);
-				writePos += writeLen;
-
-				// Write startAt
-				char timeStr[] = "2011-10-08T07:07:09";
-				int timeStrLen = strlen(timeStr);
-				struct tm *tmp = gmtime(&gameStartTime);
-				_sprintf(
-					&timeStr[0], "%04d-%02d-%02dT%02d:%02d:%02d", tmp->tm_year + 1900,
-					tmp->tm_mon + 1, tmp->tm_mday, tmp->tm_hour, tmp->tm_min, tmp->tm_sec);
-				u8 startAtOpener[] = {'U', 7, 's', 't', 'a', 'r', 't', 'A', 't', 'S', 'U', (u8)timeStrLen};
-				writeLen = sizeof(startAtOpener);
-				memcpy(&footer[writePos], startAtOpener, writeLen);
-				writePos += writeLen;
-				writeLen = timeStrLen;
-				memcpy(&footer[writePos], timeStr, writeLen);
-				writePos += writeLen;
-
-				// Write lastFrame
-				u8 lastFrameOpener[] = {'U', 9, 'l', 'a', 's', 't', 'F', 'r', 'a', 'm', 'e', 'l'};
-				writeLen = sizeof(lastFrameOpener);
-				memcpy(&footer[writePos], lastFrameOpener, writeLen);
-				writePos += writeLen;
-				memcpy(&footer[writePos], &reader.metadata.lastFrame, 4);
-				writePos += 4;
-
-				// Write console nickname
-				u8 nickLen = strlen(SlippiGetConsoleNick());
-				if (nickLen > 32) nickLen = 32;
-				u8 consoleNickOpener[] = { 'U', 11, 'c', 'o', 'n', 's', 'o', 'l', 'e', 'N', 'i', 'c', 'k', 'S', 'U', nickLen };
-				writeLen = sizeof(consoleNickOpener);
-				memcpy(&footer[writePos], consoleNickOpener, writeLen);
-				writePos += writeLen;
-				memcpy(&footer[writePos], SlippiGetConsoleNick(), nickLen);
-				writePos += nickLen;
-
-				// Write closing
-				u8 closing[] = {
-					'U', 7, 'p', 'l', 'a', 'y', 'e', 'r', 's', '{', '}',
-					'U', 8, 'p', 'l', 'a', 'y', 'e', 'd', 'O', 'n', 'S', 'U',
-					10, 'n', 'i', 'n', 't', 'e', 'n', 'd', 'o', 'n', 't',
-					'}', '}'};
-				writeLen = sizeof(closing);
-				memcpy(&footer[writePos], closing, writeLen);
-				writePos += writeLen;
+				u32 writePos = buildSlpFooter(&footer[0], &reader);
 
 				// Stream footer to FTP if upload is active
-				if (slippi_ftp_is_stream_active()) {
+				if (ftp_streaming_this_game && slippi_ftp_is_stream_active()) {
 					dbgprintf("SlippiFileWriter: Streaming footer to FTP (%d bytes)\r\n", writePos);
 					slippi_ftp_stream_data(footer, writePos);
 					
@@ -640,6 +652,15 @@ static u32 SlippiHandlerThread(void *arg)
 						dbgprintf("SlippiHandlerThread: File verification successful\r\n");
 					} else {
 						dbgprintf("SlippiHandlerThread: File verification failed (%d)\r\n", testResult);
+					}
+
+					if (ftp_enabled && !ftp_streaming_this_game && ftp_remote_path[0] != '\0') {
+						int upload_result = slippi_ftp_upload_replay_file(fileName, ftp_remote_path);
+						if (upload_result == SLIPPI_FTP_SUCCESS) {
+							dbgprintf("SlippiHandlerThread: Finalized replay uploaded via FTP (%s)\r\n", ftp_remote_path);
+						} else {
+							dbgprintf("SlippiHandlerThread: Finalized FTP upload failed (%d) for %s\r\n", upload_result, ftp_remote_path);
+						}
 					}
 				}
 				writtenByteCount = 0;
