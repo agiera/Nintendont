@@ -235,6 +235,32 @@ static u16 reassembleControllerMetadata(u32 chanBase, u8 *dest, u16 maxLen)
 	return written;
 }
 
+// Shared controller-metadata parse used by BOTH the local .slp footer writer and
+// the streamed FTP .meta.json sidecar, so the two never drift. Reads SI channel
+// `ch` (0..3) from the CMD 0xA0xx shared-memory region, verifies the call/tag
+// guards, reassembles the chunked payload into `dest`, and validates it as a flat
+// UBJSON string dict. Returns the validated byte count (including the enclosing
+// { and }), or 0 when the channel has no valid controller metadata.
+u16 SlippiReadControllerMetadata(int ch, u8 *dest, u16 maxLen)
+{
+	u32 addr;
+	u16 dataLen;
+
+	if (ch < 0 || ch > 3 || !dest)
+		return 0;
+
+	addr = SFW_EXTRA_DATA_ADDR + ch * SFW_XDATA_STRIDE;
+	sync_before_read((void*)addr, SFW_XDATA_STRIDE);
+
+	if (read32(addr + 0x04) == 0)          /* calls */
+		return 0;
+	if (read32(addr + 0x00) != 0xCA110000) /* tag */
+		return 0;
+
+	dataLen = reassembleControllerMetadata(addr, dest, maxLen);
+	return validateUbjsonStringDict(dest, dataLen);
+}
+
 // Build the complete Slippi footer (metadata block) into `footer`, including the
 // per-port controller metadata read from shared memory. Single source of truth so
 // the local (USB/SD) write and the streamed FTP upload emit identical footers.
@@ -289,25 +315,13 @@ static u32 buildSlpFooter(u8 *footer, SlpGameReader *reader)
 	writePos += writeLen;
 
 	// read controller metadata from shared memory
-	sync_before_read((void*)SFW_EXTRA_DATA_ADDR, 4 * SFW_XDATA_STRIDE);
 	static u8 dataBuf[1024];
 	int ch;
 	for (ch = 0; ch < 4; ch++)
 	{
-		u32 addr = SFW_EXTRA_DATA_ADDR + ch * SFW_XDATA_STRIDE;
-		u32 calls = read32(addr + 0x04);
-		if (calls == 0)
-			continue;
-
-		u32 tag = read32(addr + 0x00);
-		if (tag != 0xCA110000)
-			continue;
-
-		/* Reassemble data from raw chunks */
-		u16 dataLen = reassembleControllerMetadata(addr, dataBuf, sizeof(dataBuf));
-
-		/* Validate: must be a flat UBJSON dict of strings */
-		u16 validLen = validateUbjsonStringDict(dataBuf, dataLen);
+		/* Shared parse: sync + call/tag guards + reassemble + validate.
+		 * Single source of truth with the FTP .meta.json sidecar. */
+		u16 validLen = SlippiReadControllerMetadata(ch, dataBuf, sizeof(dataBuf));
 		if (validLen == 0)
 			continue;
 
@@ -353,24 +367,6 @@ void completeFile(FIL *file, SlpGameReader *reader, u32 writtenByteCount)
 	f_sync(file);
 }
 
-// Returns true once at least one channel has valid controller metadata in shared
-// memory (populated by the SI get-origin handshake during controller polling).
-// Used to defer the FTP metadata sidecar until the data actually exists.
-static bool controllerMetadataAvailable(void)
-{
-	sync_before_read((void*)SFW_EXTRA_DATA_ADDR, 4 * SFW_XDATA_STRIDE);
-	int ch;
-	for (ch = 0; ch < 4; ch++)
-	{
-		u32 addr = SFW_EXTRA_DATA_ADDR + ch * SFW_XDATA_STRIDE;
-		if (read32(addr + 0x04) == 0)
-			continue;
-		if (read32(addr + 0x00) == 0xCA110000)
-			return true;
-	}
-	return false;
-}
-
 static u32 SlippiHandlerThread(void *arg)
 {
 	dbgprintf("Slippi Thread ID: %d\r\n", thread_get_id());
@@ -381,7 +377,6 @@ static u32 SlippiHandlerThread(void *arg)
 
 	u32 writtenByteCount = 0;
 	bool ftp_streaming_this_game = false;
-	bool ftp_sidecar_sent = false;
 	char ftp_remote_path[256];
 	ftp_remote_path[0] = '\0';
 	driveTimer = read32(HW_TIMER);
@@ -458,7 +453,6 @@ static u32 SlippiHandlerThread(void *arg)
 			hasFile = false;
 			writtenByteCount = 0;
 			ftp_streaming_this_game = false;
-			ftp_sidecar_sent = false;
 			ftp_remote_path[0] = '\0';
 
 			if (ConfigGetConfig(NIN_CFG_SLIPPI_REPLAYS) && usb_ready)
@@ -582,21 +576,6 @@ static u32 SlippiHandlerThread(void *arg)
 			if (stream_result != SLIPPI_FTP_SUCCESS) {
 				dbgprintf("SlippiFileWriter: FTP stream data failed, cancelling upload\r\n");
 				slippi_ftp_cancel_stream_upload();
-			}
-		}
-
-		// Deferred metadata sidecar: the controller metadata handshake populates
-		// shared memory during the game (not at stream start), so send the sidecar
-		// exactly once, as soon as the metadata first becomes available, over its
-		// own short-lived FTP connection (the stream connection is busy).
-		if (ftp_streaming_this_game && !ftp_sidecar_sent && ftp_remote_path[0] != '\0'
-		    && controllerMetadataAvailable()) {
-			int meta_result = slippi_ftp_send_metadata_sidecar_now(ftp_remote_path);
-			if (meta_result == SLIPPI_FTP_SUCCESS) {
-				ftp_sidecar_sent = true;
-				dbgprintf("SlippiFileWriter: Sent deferred metadata sidecar for %s\r\n", ftp_remote_path);
-			} else {
-				dbgprintf("SlippiFileWriter: Deferred metadata sidecar send failed (%d), will retry\r\n", meta_result);
 			}
 		}
 

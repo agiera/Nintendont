@@ -47,12 +47,6 @@ int slippi_ftp_finish_stream_upload(void);
 void slippi_ftp_cancel_stream_upload(void);
 int slippi_ftp_is_stream_active(void);
 
-// Send the per-game controller-metadata sidecar over its own short-lived FTP
-// connection. Used to defer the sidecar until the controller metadata is
-// actually populated in shared memory (the active stream's control connection
-// is busy with the live replay transfer, so a separate connection is used).
-int slippi_ftp_send_metadata_sidecar_now(const char* remote_replay_path);
-
 // Upload a finalized replay file in one shot (preserves patched raw_len header).
 int slippi_ftp_upload_replay_file(const char* local_path, const char* remote_path);
 

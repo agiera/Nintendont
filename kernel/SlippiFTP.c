@@ -5,6 +5,7 @@ Based on ftpii FTP implementation
 */
 
 #include "SlippiFTP.h"
+#include "SlippiFileWriter.h"
 #include "Config.h"
 #include "SlippiMemory.h"
 #include "string.h"
@@ -19,19 +20,15 @@ Based on ftpii FTP implementation
 #define CRLF "\r\n"
 #define CRLF_LENGTH 2
 
-// Shared memory for CMD 0xA0xx controller metadata (ARM physical)
-#define SFW_EXTRA_DATA_ADDR  0x13080020
-#define SFW_XDATA_STRIDE     0x02B0
-#define SFW_XOFF_NCHUNKS     0x08
-#define SFW_XOFF_CHUNKS      0x10
-#define SFW_CHUNK_SIZE       80
-#define SFW_CHUNK_DATA       78
-
 #define FTP_METADATA_PLAYER_BUF 1024
-#define FTP_METADATA_UBJ_BUF 2300
-#define FTP_METADATA_HEX_BUF (FTP_METADATA_UBJ_BUF * 2 + 1)
-#define FTP_METADATA_JSON_BUF (FTP_METADATA_HEX_BUF + 64)
-#define FTP_METADATA_LOCAL_PATH "/Slippi/.slpmeta_upload.json"
+// The .meta.json body is {"ubjson_hex":"<hex>"}. We hex-encode the controller
+// UBJSON on the fly directly into this single buffer (no separate ubjson/hex
+// buffers), keeping the static footprint small (~3.4KB total incl. playerBuf +
+// remoteMetaPath) instead of the old ~12.9KB.
+#define FTP_METADATA_JSON_BUF 2100
+
+// Per-game controller-metadata .meta.json sidecar. Set to 0 to fully disable.
+#define SLIPPI_FTP_ENABLE_METADATA_SIDECAR 1
 
 // Simple implementations for missing string functions
 static char* strrchr_impl(const char* str, int c) {
@@ -62,17 +59,15 @@ static slippi_ftp_client_t stream_client;
 // Function prototypes for internal functions
 static int slippi_ftp_connect(slippi_ftp_client_t* client, const char* server, unsigned short port);
 static int slippi_ftp_authenticate(slippi_ftp_client_t* client, const char* username, const char* password);
-static int slippi_ftp_upload_file(slippi_ftp_client_t* client, const char* local_path, const char* remote_path);
+static int slippi_ftp_upload_file(slippi_ftp_client_t* client, const char* local_path, const u8* mem_buf, u32 mem_len, const char* remote_path);
 static int slippi_ftp_read_response(slippi_ftp_client_t* client);
 static int slippi_ftp_send_command(slippi_ftp_client_t* client, const char* command);
 static void slippi_ftp_disconnect(slippi_ftp_client_t* client);
 static int transfer_exact(int socket, char *buf, int length, int is_send);
 static int send_from_file(int data_socket, const char* filepath);
+static int send_from_buffer(int data_socket, const u8* buf, u32 len);
 static int slippi_ftp_upload_stream_metadata_sidecar(slippi_ftp_client_t* client, const char* remote_replay_path);
-static u16 reassembleControllerMetadata(u32 chanBase, u8 *dest, u16 maxLen);
-static u16 validateUbjsonStringDict(const u8 *buf, u16 len);
-static int build_stream_metadata_ubjson(u8* out, u16 out_len);
-static void bytes_to_hex(const u8* src, u16 len, char* dest);
+static int build_stream_metadata_json(char* out, u16 outCap);
 
 // Initialize FTP client system
 int slippi_ftp_init(void) {
@@ -259,124 +254,95 @@ static int send_from_file(int data_socket, const char* filepath) {
 	}
 }
 
-/* Validate UBJSON object containing only string key/value pairs.
- * Returns validated byte count (including { and }), or 0 on failure. */
-static u16 validateUbjsonStringDict(const u8 *buf, u16 len)
-{
-	if (len < 2 || buf[0] != '{')
-		return 0;
+// Send an in-memory buffer over the data socket (no local file staging needed)
+static int send_from_buffer(int data_socket, const u8* buf, u32 len) {
+	if (!buf)
+		return -1;
 
-	u16 pos = 1;
-	while (pos < len && buf[pos] != '}')
-	{
-		u16 i;
-		if (pos + 2 > len || (buf[pos] != 'U' && buf[pos] != 'i'))
-			return 0;
-		u8 keyLen = buf[pos + 1];
-		pos += 2;
-		if (keyLen == 0 || pos + keyLen > len)
-			return 0;
-		for (i = 0; i < keyLen; i++)
-			if (buf[pos + i] < 0x20 || buf[pos + i] > 0x7E)
-				return 0;
-		pos += keyLen;
-
-		if (pos + 3 > len || buf[pos] != 'S' ||
-		    (buf[pos + 1] != 'U' && buf[pos + 1] != 'i'))
-			return 0;
-		u8 valLen = buf[pos + 2];
-		pos += 3;
-		if (pos + valLen > len)
-			return 0;
-		for (i = 0; i < valLen; i++)
-			if (buf[pos + i] < 0x20 || buf[pos + i] > 0x7E)
-				return 0;
-		pos += valLen;
+	u32 total_sent = 0;
+	while (total_sent < len) {
+		u32 chunk = len - total_sent;
+		if (chunk > 1024)
+			chunk = 1024;
+		int send_result = transfer_exact(data_socket, (char*)(buf + total_sent), chunk, 1);
+		if (send_result < 0) {
+			dbgprintf("FTP: Failed to send buffer data at byte %d\r\n", total_sent);
+			return send_result;
+		}
+		total_sent += chunk;
 	}
 
-	if (pos >= len || buf[pos] != '}')
-		return 0;
-
-	return pos + 1;
+	dbgprintf("FTP: Successfully sent %d buffer bytes (100%%)\r\n", total_sent);
+	return 0;
 }
 
-/* Reassemble data from raw 80-byte SI chunks into contiguous buffer. */
-static u16 reassembleControllerMetadata(u32 chanBase, u8 *dest, u16 maxLen)
+/* Build the full .meta.json body {"ubjson_hex":"<hex>"} directly into `out`,
+ * hex-encoding the controller-metadata UBJSON on the fly. This avoids the large
+ * intermediate UBJSON/hex/JSON buffers (~12.9KB) that previously lived in this
+ * call graph; only `out` (FTP_METADATA_JSON_BUF) plus a 1KB reassembly scratch
+ * are needed. If the payload would exceed `outCap`, whole channels are dropped
+ * at a boundary so the emitted UBJSON stays well-formed.
+ * Returns the JSON length, or 0 if no controller metadata is available. */
+static int build_stream_metadata_json(char* out, u16 outCap)
 {
-	u32 nChunks  = read32(chanBase + SFW_XOFF_NCHUNKS);
-
-	if (nChunks == 0 || nChunks > 8)
-		return 0;
-
-	u16 written = 0;
-	u32 i;
-	for (i = 0; i < nChunks && written < maxLen; i++)
-	{
-		u8 *chunkN = (u8*)(chanBase + SFW_XOFF_CHUNKS + i * SFW_CHUNK_SIZE);
-		u16 copyLen = SFW_CHUNK_DATA;
-		if (written + copyLen > maxLen)
-			copyLen = maxLen - written;
-		memcpy(dest + written, chunkN + 2, copyLen);
-		written += copyLen;
-	}
-
-	return written;
-}
-
-static int build_stream_metadata_ubjson(u8* out, u16 out_len)
-{
-	u16 writePos = 0;
-	int ch;
+	static const char hexdigits[] = "0123456789abcdef";
 	static u8 playerBuf[FTP_METADATA_PLAYER_BUF];
+	const char* pfx = "{\"ubjson_hex\":\"";
+	u16 pos = 0;
+	int ch;
+	int haveAny = 0;
 
-	if (!out || out_len < 2)
+	if (!out || outCap < 32)
 		return 0;
 
-	out[writePos++] = '{';
+	while (*pfx)
+		out[pos++] = *pfx++;
 
-	/* Ensure coherent read from shared metadata memory. */
-	sync_before_read((void*)SFW_EXTRA_DATA_ADDR, 4 * SFW_XDATA_STRIDE);
+#define SFW_APPEND_HEX_BYTE(b) do { \
+		out[pos++] = hexdigits[((b) >> 4) & 0x0F]; \
+		out[pos++] = hexdigits[(b) & 0x0F]; \
+	} while (0)
+
+	/* UBJSON object opens with '{'. */
+	SFW_APPEND_HEX_BYTE('{');
 
 	for (ch = 0; ch < 4; ch++)
 	{
-		u32 addr = SFW_EXTRA_DATA_ADDR + ch * SFW_XDATA_STRIDE;
-		u32 calls = read32(addr + 0x04);
-		if (calls == 0)
-			continue;
+		u16 validLen, needed, i;
 
-		u32 tag = read32(addr + 0x00);
-		if (tag != 0xCA110000)
-			continue;
-
-		u16 dataLen = reassembleControllerMetadata(addr, playerBuf, sizeof(playerBuf));
-		u16 validLen = validateUbjsonStringDict(playerBuf, dataLen);
+		/* Shared parse: sync + call/tag guards + reassemble + validate.
+		 * Single source of truth with the local .slp footer writer. */
+		validLen = SlippiReadControllerMetadata(ch, playerBuf, sizeof(playerBuf));
 		if (validLen == 0)
 			continue;
 
-		if (writePos + 3 + validLen + 1 > out_len)
+		/* Hex for this channel = (3 marker bytes + validLen) * 2. Reserve room
+		 * for the closing '}' hex (2) + suffix "\"}" (2) + NUL (1). */
+		needed = (u16)((3 + validLen) * 2);
+		if ((u32)pos + needed + 5 >= outCap)
 			break;
 
-		out[writePos++] = 'U';
-		out[writePos++] = 1;
-		out[writePos++] = '0' + ch;
-		memcpy(&out[writePos], playerBuf, validLen);
-		writePos += validLen;
+		SFW_APPEND_HEX_BYTE('U');
+		SFW_APPEND_HEX_BYTE(1);
+		SFW_APPEND_HEX_BYTE('0' + ch);
+		for (i = 0; i < validLen; i++)
+			SFW_APPEND_HEX_BYTE(playerBuf[i]);
+		haveAny = 1;
 	}
 
-	out[writePos++] = '}';
-	return writePos;
-}
+	/* UBJSON object closes with '}'. */
+	SFW_APPEND_HEX_BYTE('}');
 
-static void bytes_to_hex(const u8* src, u16 len, char* dest)
-{
-	static const char hexdigits[] = "0123456789abcdef";
-	u16 i;
-	for (i = 0; i < len; i++)
-	{
-		dest[i * 2] = hexdigits[(src[i] >> 4) & 0x0F];
-		dest[i * 2 + 1] = hexdigits[src[i] & 0x0F];
-	}
-	dest[len * 2] = '\0';
+#undef SFW_APPEND_HEX_BYTE
+
+	out[pos++] = '"';
+	out[pos++] = '}';
+	out[pos] = '\0';
+
+	if (!haveAny)
+		return 0;
+
+	return (int)pos;
 }
 
 static int parse_ipv4_literal(const char* server, u32* out_ip)
@@ -407,21 +373,23 @@ static int slippi_ftp_upload_stream_metadata_sidecar(slippi_ftp_client_t* client
 {
 	if (!client || !client->connected || !client->authenticated || !remote_replay_path)
 		return SLIPPI_FTP_ERROR;
+#if SLIPPI_FTP_ENABLE_METADATA_SIDECAR
+	/*
+	 * Static (BSS) storage, not stack: the SlippiHandlerThread stack is only
+	 * 0x2000 (8KB) per kernel.ld. jsonPayload + remoteMetaPath plus the 1KB
+	 * reassembly scratch inside build_stream_metadata_json total ~3.4KB. This
+	 * function only runs on SlippiHandlerThread and is not reentrant, so static
+	 * storage is safe.
+	 */
+	static char jsonPayload[FTP_METADATA_JSON_BUF];
+	static char remoteMetaPath[320];
 
-	u8 ubjPayload[FTP_METADATA_UBJ_BUF];
-	char hexPayload[FTP_METADATA_HEX_BUF];
-	char jsonPayload[FTP_METADATA_JSON_BUF];
-	char remoteMetaPath[320];
-
-	int ubjLen = build_stream_metadata_ubjson(ubjPayload, sizeof(ubjPayload));
-	if (ubjLen <= 2)
+	int jsonLen = build_stream_metadata_json(jsonPayload, sizeof(jsonPayload));
+	if (jsonLen <= 0)
 	{
 		dbgprintf("FTP: No controller metadata available for metadata sidecar\r\n");
 		return SLIPPI_FTP_SUCCESS;
 	}
-
-	bytes_to_hex(ubjPayload, (u16)ubjLen, hexPayload);
-	_sprintf(jsonPayload, "{\"ubjson_hex\":\"%s\"}", hexPayload);
 
 	if (strlen(remote_replay_path) + strlen(".meta.json") + 1 >= sizeof(remoteMetaPath))
 	{
@@ -430,25 +398,7 @@ static int slippi_ftp_upload_stream_metadata_sidecar(slippi_ftp_client_t* client
 	}
 	_sprintf(remoteMetaPath, "%s.meta.json", remote_replay_path);
 
-	FIL metaFile;
-	UINT wrote = 0;
-	FRESULT openResult = f_open_secondary_drive(&metaFile, FTP_METADATA_LOCAL_PATH, FA_CREATE_ALWAYS | FA_WRITE);
-	if (openResult != FR_OK)
-	{
-		dbgprintf("FTP: Failed to create local metadata sidecar (%d)\r\n", openResult);
-		return SLIPPI_FTP_SUCCESS;
-	}
-
-	UINT jsonLen = strlen(jsonPayload);
-	FRESULT writeResult = f_write(&metaFile, jsonPayload, jsonLen, &wrote);
-	f_close(&metaFile);
-	if (writeResult != FR_OK || wrote != jsonLen)
-	{
-		dbgprintf("FTP: Failed to write local metadata sidecar (%d, wrote=%d/%d)\r\n", writeResult, wrote, jsonLen);
-		return SLIPPI_FTP_SUCCESS;
-	}
-
-	int uploadResult = slippi_ftp_upload_file(client, FTP_METADATA_LOCAL_PATH, remoteMetaPath);
+	int uploadResult = slippi_ftp_upload_file(client, NULL, (const u8*)jsonPayload, (u32)jsonLen, remoteMetaPath);
 	if (uploadResult != SLIPPI_FTP_SUCCESS)
 	{
 		dbgprintf("FTP: Failed to upload metadata sidecar (%d)\r\n", uploadResult);
@@ -459,35 +409,10 @@ static int slippi_ftp_upload_stream_metadata_sidecar(slippi_ftp_client_t* client
 
 	dbgprintf("FTP: Uploaded metadata sidecar to %s\r\n", remoteMetaPath);
 	return SLIPPI_FTP_SUCCESS;
-}
-
-// Send the metadata sidecar over its own short-lived FTP connection. This lets
-// callers defer the sidecar until controller metadata is actually available
-// (the live replay stream is using stream_client, so we open a separate one).
-int slippi_ftp_send_metadata_sidecar_now(const char* remote_replay_path)
-{
-	extern s32 top_fd;
-
-	if (!ftp_initialized || !slippi_settings || !slippi_settings->ftp_enabled)
-		return SLIPPI_FTP_ERROR;
-	if (!remote_replay_path || remote_replay_path[0] == '\0')
-		return SLIPPI_FTP_ERROR;
-	if (top_fd < 0)
-		return SLIPPI_FTP_CONNECT_FAIL;
-
-	slippi_ftp_client_t meta_client;
-	if (slippi_ftp_connect(&meta_client, slippi_settings->ftp_server, slippi_settings->ftp_port) != SLIPPI_FTP_SUCCESS)
-		return SLIPPI_FTP_CONNECT_FAIL;
-
-	if (slippi_ftp_authenticate(&meta_client, slippi_settings->ftp_username, slippi_settings->ftp_password) != SLIPPI_FTP_SUCCESS)
-	{
-		slippi_ftp_disconnect(&meta_client);
-		return SLIPPI_FTP_AUTH_FAIL;
-	}
-
-	int result = slippi_ftp_upload_stream_metadata_sidecar(&meta_client, remote_replay_path);
-	slippi_ftp_disconnect(&meta_client);
-	return result;
+#else
+	(void)remote_replay_path;
+	return SLIPPI_FTP_SUCCESS;
+#endif
 }
 // Authenticate with FTP server
 static int slippi_ftp_authenticate(slippi_ftp_client_t* client, const char* username, const char* password) {
@@ -566,8 +491,9 @@ static int slippi_ftp_authenticate(slippi_ftp_client_t* client, const char* user
 	return SLIPPI_FTP_SUCCESS;
 }
 
-// Upload a file via FTP - based on ftpii's STOR implementation
-static int slippi_ftp_upload_file(slippi_ftp_client_t* client, const char* local_path, const char* remote_path) {
+// Upload a file via FTP - based on ftpii's STOR implementation.
+// If local_path is NULL, mem_buf/mem_len are STORed directly from memory instead.
+static int slippi_ftp_upload_file(slippi_ftp_client_t* client, const char* local_path, const u8* mem_buf, u32 mem_len, const char* remote_path) {
 	extern s32 top_fd;
 	
 	if (!client->connected || !client->authenticated) {
@@ -575,7 +501,7 @@ static int slippi_ftp_upload_file(slippi_ftp_client_t* client, const char* local
 		return SLIPPI_FTP_ERROR;
 	}
 	
-	dbgprintf("FTP: Starting upload process for %s\r\n", local_path);
+	dbgprintf("FTP: Starting upload process for %s\r\n", local_path ? local_path : "<memory>");
 	
 	// Set binary mode (TYPE I)
 	dbgprintf("FTP: Sending TYPE I command\r\n");
@@ -741,9 +667,10 @@ pasv_success:
 		return SLIPPI_FTP_UPLOAD_FAIL;
 	}
 	
-	// Transfer file data
+	// Transfer data
 	dbgprintf("FTP: Starting file data transfer\r\n");
-	int file_result = send_from_file(data_socket, local_path);
+	int file_result = local_path ? send_from_file(data_socket, local_path)
+	                             : send_from_buffer(data_socket, mem_buf, mem_len);
 	dbgprintf("FTP: File transfer result: %d\r\n", file_result);
 	
 	// Close data connection
@@ -1044,11 +971,15 @@ int slippi_ftp_start_stream_upload(const char* local_path, const char* remote_pa
 		return SLIPPI_FTP_AUTH_FAIL;
 	}
 
-	// NOTE: The per-game metadata sidecar is NOT sent here. At stream start the
-	// controller metadata (0xCA110000 shared memory) has not been populated yet
-	// by the SI get-origin handshake, so it would be empty. The sidecar is
-	// deferred and sent once the metadata becomes available during the game
-	// (see slippi_ftp_send_metadata_sidecar_now in the streaming loop).
+	// Upload the controller-metadata .meta.json sidecar on this same control
+	// connection before the main .slp STOR. Non-fatal: a missing or failed
+	// sidecar must not abort the replay upload, so we only bail on a lost
+	// connection (which would sink the main upload anyway).
+	int meta_result = slippi_ftp_upload_stream_metadata_sidecar(&stream_client, remote_path);
+	if (meta_result == SLIPPI_FTP_CONNECT_FAIL) {
+		slippi_ftp_disconnect(&stream_client);
+		return SLIPPI_FTP_CONNECT_FAIL;
+	}
 
 	// Set binary mode
 	int send_result = slippi_ftp_send_command(&stream_client, "TYPE I");
@@ -1317,7 +1248,7 @@ int slippi_ftp_upload_replay_file(const char* local_path, const char* remote_pat
 
 	result = slippi_ftp_upload_stream_metadata_sidecar(&client, remote_path);
 	if (result == SLIPPI_FTP_SUCCESS) {
-		result = slippi_ftp_upload_file(&client, local_path, remote_path);
+		result = slippi_ftp_upload_file(&client, local_path, NULL, 0, remote_path);
 	}
 
 	slippi_ftp_disconnect(&client);
