@@ -28,7 +28,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 /* PPC writes to 0xD3080000 (uncached) = ARM 0x13080000.
  * Per-channel data starts at +0x20 with stride 0x410. */
 #define CONTROLLER_METADATA_BASE 0x13080000
-// 0x20 header + 4 channels * 0x410 stride
+// 0x20 header + 4 channels * 0x2B0 stride
 #define CONTROLLER_METADATA_SIZE 0x0AE0
 
 

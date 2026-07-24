@@ -13,7 +13,7 @@
 #  Max total data = 8 * 78 = 624 bytes.
 #
 #  Per-channel shared memory layout (base +0x20, stride 0x2B0):
-#    +0x000  tag        u32   (TAG_OK / TAG_NODATA / error tags)
+#    +0x000  tag        u32   (TAG_OK / TAG_NODATA / TAG_IN_PROGRESS / error tags)
 #    +0x004  calls      u32   (monotonic "data ready" counter)
 #    +0x008  n_chunks   u32   (number of 80-byte chunks, 1-8)
 #    +0x00C  dbg_comcsr u32   (raw COMCSR value on error/completion)
@@ -45,6 +45,10 @@
 .set CHUNK_SIZE,          80
 .set MAX_CHUNKS,          8
 .set MAX_ATTEMPTS,        2
+
+.set TAG_OK,              0xCA110000
+.set TAG_NODATA,          0xCA110001
+.set TAG_IN_PROGRESS,     0xCA110002
 
 SIGetTypeControllerMetadata:
     lwz     r31, -0x5A68(r13)
@@ -78,6 +82,14 @@ SIGetTypeControllerMetadata:
     lwz     r9, XOFF_ATTEMPTS(r5)
     cmpwi   r9, MAX_ATTEMPTS
     bge     .Lcap_exit
+
+    # Starting an actual probe sequence: mark state as in-progress so
+    # readers never treat previous successful data as current.
+    lis     r9, TAG_IN_PROGRESS@h
+    ori     r9, r9, TAG_IN_PROGRESS@l
+    stw     r9, XOFF_TAG(r5)
+    li      r9, 0
+    stw     r9, XOFF_NCHUNKS(r5)
 
     # r6 = COMCSR address (constant)
     lis     r6, SI_HW_COMCSR@h
@@ -238,7 +250,8 @@ SIGetTypeControllerMetadata:
 
     # All chunks received — store success
     stw     r11, XOFF_NCHUNKS(r5)
-    lis     r9, 0xCA11
+    lis     r9, TAG_OK@h
+    ori     r9, r9, TAG_OK@l
     stw     r9, XOFF_TAG(r5)
     b       .Lrestore
 
@@ -247,8 +260,8 @@ SIGetTypeControllerMetadata:
     lwz     r9, 0(r8)
     stw     r9, XOFF_DBG_IOBUF0(r5)
     stw     r12, XOFF_DBG_CMDIDX(r5)
-    lis     r9, 0xCA11
-    ori     r9, r9, 0x0001
+    lis     r9, TAG_NODATA@h
+    ori     r9, r9, TAG_NODATA@l
     stw     r9, XOFF_TAG(r5)
     li      r9, 0
     stw     r9, XOFF_NCHUNKS(r5)
