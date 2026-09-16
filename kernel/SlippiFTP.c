@@ -8,6 +8,7 @@ Based on ftpii FTP implementation
 #include "SlippiFileWriter.h"
 #include "Config.h"
 #include "SlippiMemory.h"
+#include "common.h"
 #include "string.h"
 #include "syscalls.h"
 #include "vsprintf.h"
@@ -814,57 +815,45 @@ static int slippi_ftp_read_response(slippi_ftp_client_t* client) {
 // Transfer exact amount of data - based on ftpii's transfer_exact
 static int transfer_exact(int socket, char *buf, int length, int is_send) {
 	extern s32 top_fd;
-	
+
 	int result = 0;
 	int remaining = length;
 	int bytes_transferred;
 	int timeout_attempts = 0;
-	int connection_failures = 0;
-	const int max_timeout_attempts = 100; // About 10 seconds of retries
-	const int max_connection_failures = 5; // Allow a few connection failures before giving up
-	
+	// Wi-Fi stalls of several seconds are routine at a busy venue; the game
+	// data ring (SLIPMEM_SIZE) buffers minutes of play, so waiting is safe.
+	const int retry_delay_ms = 50;
+	const int max_timeout_attempts = 300; // 15 seconds of retries
+
 	while (remaining > 0) {
 		if (is_send) {
 			bytes_transferred = sendto(top_fd, socket, buf, remaining, 0);
 		} else {
 			bytes_transferred = recvfrom(top_fd, socket, buf, remaining, 0);
 		}
-		
+
 		if (bytes_transferred > 0) {
 			remaining -= bytes_transferred;
 			buf += bytes_transferred;
 			timeout_attempts = 0; // Reset timeout counter on successful transfer
-			connection_failures = 0; // Reset connection failure counter
 		} else if (bytes_transferred == 0) {
-			// Connection closed by peer
-			connection_failures++;
-			dbgprintf("FTP: Connection closed by peer during transfer (attempt %d/%d)\r\n", 
-				connection_failures, max_connection_failures);
-			if (connection_failures >= max_connection_failures) {
-				dbgprintf("FTP: Too many connection failures, aborting transfer\r\n");
-				result = -1;
-				break;
-			}
-			// Small delay before giving up
-			volatile int delay_count;
-			for (delay_count = 0; delay_count < 200000; delay_count++);
+			// Connection closed by peer; nothing more can be sent on this socket.
+			dbgprintf("FTP: Connection closed by peer during transfer\r\n");
 			result = -1;
 			break;
-		} else if (bytes_transferred < 0) {
+		} else {
 			// Network error - could be temporary, try again with timeout
 			timeout_attempts++;
 			if (timeout_attempts > max_timeout_attempts) {
-				dbgprintf("FTP: Transfer timeout after %d attempts\r\n", timeout_attempts);
+				dbgprintf("FTP: Transfer timeout after %d attempts (%d ms)\r\n",
+					timeout_attempts, timeout_attempts * retry_delay_ms);
 				result = -1;
 				break;
 			}
-			// Small delay before retry
-			volatile int delay_count;
-			for (delay_count = 0; delay_count < 100000; delay_count++);
-			continue;
+			mdelay(retry_delay_ms);
 		}
 	}
-	
+
 	return result < 0 ? result : length;
 }
 static int slippi_ftp_send_command(slippi_ftp_client_t* client, const char* command) {
@@ -1198,18 +1187,30 @@ int slippi_ftp_finish_stream_upload(void) {
 void slippi_ftp_cancel_stream_upload(void) {
 	extern s32 top_fd;
 	
-	if (!stream_upload.active) {
+	// A failed send already cleared `active`; still tear the sockets down so
+	// the server does not sit on a half-open transfer until its data timeout.
+	if (!stream_upload.active && stream_upload.data_socket < 0 && stream_client.socket < 0) {
 		return;
 	}
-	
+
 	dbgprintf("FTP Stream: Cancelling active upload\r\n");
-	
+
+	// Drop the control connection first, without QUIT. A data-socket close on
+	// its own is the FTP "transfer complete" signal and would make the server
+	// ingest the truncated file; losing the control channel mid-transfer makes
+	// it discard the partial upload instead.
+	if (stream_client.socket >= 0) {
+		close(top_fd, stream_client.socket);
+		stream_client.socket = -1;
+	}
+	stream_client.connected = 0;
+	stream_client.authenticated = 0;
+
 	if (stream_upload.data_socket >= 0) {
 		close(top_fd, stream_upload.data_socket);
 		stream_upload.data_socket = -1;
 	}
-	
-	slippi_ftp_disconnect(&stream_client);
+
 	stream_upload.active = 0;
 }
 

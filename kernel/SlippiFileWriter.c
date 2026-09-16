@@ -433,16 +433,21 @@ static u32 SlippiHandlerThread(void *arg)
 		if (err)
 		{
 			if (err == SLP_READ_OVERFLOW)
+			{
 				memReadPos = SlippiRestoreReadPos();
-			
-			// Cancel any active FTP streaming upload on error
-			if (slippi_ftp_is_stream_active()) {
-				dbgprintf("SlippiFileWriter: Memory read error, cancelling FTP stream upload\r\n");
-				slippi_ftp_cancel_stream_upload();
+
+				// Game data was lost, so the stream can never be a valid replay.
+				// Other read errors still return the bytes read so far and are
+				// recoverable; cancelling on them would truncate a good stream.
+				if (slippi_ftp_is_stream_active()) {
+					dbgprintf("SlippiFileWriter: Memory read overflow, cancelling FTP stream upload\r\n");
+					slippi_ftp_cancel_stream_upload();
+					ftp_streaming_this_game = false;
+				}
 			}
-				
+
 			mdelay(LED_FLASH_TIME_MS + 1000); // we always want LED visibly off if this happens
-			
+
 			// For specific errors, bytes will still be read. Not continueing to deal with those
 		}
 
@@ -574,8 +579,11 @@ static u32 SlippiHandlerThread(void *arg)
 		if (ftp_streaming_this_game && slippi_ftp_is_stream_active() && wrote > 0) {
 			int stream_result = slippi_ftp_stream_data(readBuf, wrote);
 			if (stream_result != SLIPPI_FTP_SUCCESS) {
-				dbgprintf("SlippiFileWriter: FTP stream data failed, cancelling upload\r\n");
+				dbgprintf("SlippiFileWriter: FTP stream data failed, cancelling upload; will retry as full-file upload at game end\r\n");
 				slippi_ftp_cancel_stream_upload();
+				// Clearing this re-arms the post-game slippi_ftp_upload_replay_file
+				// fallback so a truncated stream is replaced by the complete file.
+				ftp_streaming_this_game = false;
 			}
 		}
 
@@ -597,14 +605,20 @@ static u32 SlippiHandlerThread(void *arg)
 				// Stream footer to FTP if upload is active
 				if (ftp_streaming_this_game && slippi_ftp_is_stream_active()) {
 					dbgprintf("SlippiFileWriter: Streaming footer to FTP (%d bytes)\r\n", writePos);
-					slippi_ftp_stream_data(footer, writePos);
-					
-					// Finish the streaming upload
-					int stream_result = slippi_ftp_finish_stream_upload();
+					int footer_result = slippi_ftp_stream_data(footer, writePos);
+					int stream_result = SLIPPI_FTP_UPLOAD_FAIL;
+					if (footer_result == SLIPPI_FTP_SUCCESS) {
+						// Finish the streaming upload
+						stream_result = slippi_ftp_finish_stream_upload();
+					} else {
+						dbgprintf("SlippiFileWriter: FTP footer send failed (%d)\r\n", footer_result);
+						slippi_ftp_cancel_stream_upload();
+					}
 					if (stream_result == SLIPPI_FTP_SUCCESS) {
 						dbgprintf("SlippiFileWriter: FTP stream upload completed successfully\r\n");
 					} else {
-						dbgprintf("SlippiFileWriter: FTP stream upload failed to complete (%d)\r\n", stream_result);
+						dbgprintf("SlippiFileWriter: FTP stream upload failed to complete (%d); falling back to full-file upload\r\n", stream_result);
+						ftp_streaming_this_game = false;
 					}
 				}
 				if (ConfigGetConfig(NIN_CFG_SLIPPI_REPLAYS) && (!use_usb || mounted))
