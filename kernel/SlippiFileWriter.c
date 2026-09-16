@@ -521,25 +521,22 @@ static u32 SlippiHandlerThread(void *arg)
 				strncpy(ftp_remote_path, remote_path, sizeof(ftp_remote_path) - 1);
 				ftp_remote_path[sizeof(ftp_remote_path) - 1] = '\0';
 
-				// Prefer finalized one-shot upload when we can write locally, so raw_len is patched.
-				if (!(ConfigGetConfig(NIN_CFG_SLIPPI_REPLAYS) && usb_ready)) {
-					dbgprintf("SlippiFileWriter: Local replay unavailable, falling back to FTP streaming (%s)\r\n", remote_path);
-					int stream_result = slippi_ftp_start_stream_upload(fileName, remote_path);
-					if (stream_result == SLIPPI_FTP_SUCCESS)
-					{
-						ftp_streaming_this_game = true;
-						dbgprintf("SlippiFileWriter: FTP stream upload started successfully\r\n");
-						
-						// Stream the header that would have been written to file
-						u8 header[] = {'{', 'U', 3, 'r', 'a', 'w', '[', '$', 'U', '#', 'l', 0, 0, 0, 0};
-						slippi_ftp_stream_data(header, sizeof(header));
-					}
-					else
-					{
-						dbgprintf("SlippiFileWriter: Failed to start FTP stream upload (%d)\r\n", stream_result);
-					}
-				} else {
-					dbgprintf("SlippiFileWriter: Deferring FTP upload until finalized file is complete (%s)\r\n", remote_path);
+				// Always live-stream when FTP is on, even with a USB present. The
+				// server patches raw_len itself, and the post-game full-file
+				// upload remains as the fallback if the stream fails.
+				int stream_result = slippi_ftp_start_stream_upload(fileName, remote_path);
+				if (stream_result == SLIPPI_FTP_SUCCESS)
+				{
+					ftp_streaming_this_game = true;
+					dbgprintf("SlippiFileWriter: FTP stream upload started successfully\r\n");
+
+					// Stream the header that would have been written to file
+					u8 header[] = {'{', 'U', 3, 'r', 'a', 'w', '[', '$', 'U', '#', 'l', 0, 0, 0, 0};
+					slippi_ftp_stream_data(header, sizeof(header));
+				}
+				else
+				{
+					dbgprintf("SlippiFileWriter: Failed to start FTP stream upload (%d); will upload finalized file at game end if written locally\r\n", stream_result);
 				}
 			}
 		}
