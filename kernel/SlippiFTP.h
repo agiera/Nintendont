@@ -51,6 +51,14 @@ int slippi_ftp_is_stream_active(void);
 int slippi_ftp_upload_replay_file(const char* local_path, const char* remote_path);
 
 typedef struct {
+    u32 mss_start;
+    u32 mss_min;
+    u32 raises;
+    int raise_result;
+    u32 mss_after_raise;
+} slippi_ftp_tcp_diagnostics_t;
+
+typedef struct {
     u32 bytes_sent;
     u32 stalls;
     u32 max_stall_ms;
@@ -63,6 +71,7 @@ typedef struct {
     int fallback_result;
     int local_available;
     u32 game_end_seen;
+    slippi_ftp_tcp_diagnostics_t tcp;
 } slippi_ftp_diagnostics_t;
 
 void slippi_ftp_reset_diagnostics(void);

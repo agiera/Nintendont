@@ -70,6 +70,34 @@ static bool diagnostic_expired(void) {
 	return diagnostic_upload && (elapsed_ms(diagnostic_timer) >= 1500 || gameState.inGame);
 }
 
+static u32 mss_check_timer;
+
+static u32 tcp_read_mss(int socket) {
+	extern s32 top_fd;
+	u32 mss = 0, len = sizeof(mss);
+	if (getsockopt(top_fd, socket, IPPROTO_TCP, TCP_MAXSEG, &mss, &len) < 0)
+		return 0;
+	if (!diagnostics.tcp.mss_min || mss < diagnostics.tcp.mss_min)
+		diagnostics.tcp.mss_min = mss;
+	return mss;
+}
+
+// IOS drops to a 536 B MSS after consecutive RTOs and never restores it on its own.
+static void tcp_restore_mss(int socket) {
+	extern s32 top_fd;
+	if (diagnostics.tcp.mss_start < 536 || diagnostics.tcp.mss_start > 1460 ||
+	    diagnostics.tcp.raise_result < 0 || elapsed_ms(mss_check_timer) < 1000)
+		return;
+	mss_check_timer = read32(HW_TIMER);
+	u32 mss = tcp_read_mss(socket);
+	if (!mss || mss >= diagnostics.tcp.mss_start)
+		return;
+	u32 target = diagnostics.tcp.mss_start;
+	diagnostics.tcp.raises++;
+	diagnostics.tcp.raise_result = setsockopt(top_fd, socket, IPPROTO_TCP, TCP_MAXSEG, &target, sizeof(target));
+	diagnostics.tcp.mss_after_raise = tcp_read_mss(socket);
+}
+
 static s32 ftp_connect_socket(s32 descriptor, struct sockaddr* address) {
 	extern s32 top_fd;
 	if (!diagnostic_upload)
@@ -902,6 +930,7 @@ static int transfer_exact(int socket, char *buf, int length, int is_send) {
 				u32 stalled_ms = elapsed_ms(progress_timer);
 				if (stalled_ms > diagnostics.max_stall_ms)
 					diagnostics.max_stall_ms = stalled_ms;
+				tcp_restore_mss(socket);
 			}
 			remaining -= bytes_transferred;
 			buf += bytes_transferred;
@@ -1161,6 +1190,8 @@ stream_data_connect_success:
 	{
 		u32 nodelay = 1;
 		setsockopt(top_fd, stream_upload.data_socket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+		diagnostics.tcp.mss_start = tcp_read_mss(stream_upload.data_socket);
+		mss_check_timer = read32(HW_TIMER);
 
 		// Send STOR command
 		char stor_cmd[256];
@@ -1346,6 +1377,7 @@ void slippi_ftp_reset_diagnostics(void) {
 	diagnostics.footer_result = 1;
 	diagnostics.finish_result = 1;
 	diagnostics.fallback_result = 1;
+	diagnostics.tcp.raise_result = 1;
 }
 
 slippi_ftp_diagnostics_t* slippi_ftp_get_diagnostics(void) {
@@ -1354,7 +1386,7 @@ slippi_ftp_diagnostics_t* slippi_ftp_get_diagnostics(void) {
 
 int slippi_ftp_upload_diagnostics(const char* remote_path) {
 	extern s32 top_fd;
-	// Worst case is ~1.1 KB (base fields + 4 controller ports); server caps at 2048.
+	// Worst case is ~1.2 KB (base fields + tcp + 4 controller ports); server caps at 2048.
 	static char payload[1536];
 	static char filename[256];
 	static slippi_ftp_client_t client;
@@ -1370,11 +1402,15 @@ int slippi_ftp_upload_diagnostics(const char* remote_path) {
 		"\"max_backlog\":%u,\"last_socket_error\":%d,\"start_result\":%d,"
 		"\"cancel_reason\":%d,\"footer_result\":%d,\"finish_result\":%d,"
 		"\"fallback_result\":%d,\"local_available\":%d,\"game_end_seen\":%u,"
+		"\"tcp\":{\"mss_start\":%u,\"mss_min\":%u,\"raises\":%u,"
+		"\"raise_result\":%d,\"mss_after_raise\":%u},"
 		"\"controller_ports\":[",
 		diagnostics.bytes_sent, diagnostics.stalls, diagnostics.max_stall_ms,
 		diagnostics.max_backlog, diagnostics.last_socket_error, diagnostics.start_result,
 		diagnostics.cancel_reason, diagnostics.footer_result, diagnostics.finish_result,
-		diagnostics.fallback_result, diagnostics.local_available, diagnostics.game_end_seen);
+		diagnostics.fallback_result, diagnostics.local_available, diagnostics.game_end_seen,
+		diagnostics.tcp.mss_start, diagnostics.tcp.mss_min, diagnostics.tcp.raises,
+		diagnostics.tcp.raise_result, diagnostics.tcp.mss_after_raise);
 	for (ch = 0; ch < 4; ch++) {
 		SlippiGetControllerProbeState(ch, &probe);
 		len += _sprintf(payload + len,

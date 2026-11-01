@@ -331,6 +331,33 @@ s32 setsockopt(s32 fd, s32 socket, u32 level, u32 optname, void *optval, u32 opt
 	return res;
 }
 
+/* getsockopt()
+ * IOS reads {socket, level, optname, optlen} from the 0x18-byte output buffer
+ * and writes optlen/optval back into it (layout per Dolphin's IOS HLE).
+ */
+s32 getsockopt(s32 fd, s32 socket, u32 level, u32 optname, void *optval, u32 *optlen)
+{
+	s32 res;
+	STACK_ALIGN(u32, params, 6, 32);
+
+	if (fd < 0) return -62;
+	if (*optlen > 8) return -28;
+
+	params[0] = socket;
+	params[1] = level;
+	params[2] = optname;
+	params[3] = *optlen;
+	params[4] = 0xFFFFFFFF;
+	params[5] = 0xFFFFFFFF;
+	res = IOS_Ioctl(fd, IOCTL_SO_GETSOCKOPT, NULL, 0, params, 0x18);
+	if (res >= 0) {
+		memcpy(optval, &params[4], *optlen);
+		*optlen = params[3];
+	}
+
+	return res;
+}
+
 /* poll()
  * Poll for events on a socket.
  */
