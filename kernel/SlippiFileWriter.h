@@ -15,4 +15,20 @@ void SlippiFileWriterShutdown();
 // the channel has no valid controller metadata.
 u16 SlippiReadControllerMetadata(int ch, u8 *dest, u16 maxLen);
 
+// Raw PPC probe bookkeeping for SI channel `ch`, for .diag.json troubleshooting.
+typedef struct {
+	u32 tag;
+	u32 calls;
+	u32 n_chunks;
+	u32 comcsr;
+	u32 iobuf0;
+	s32 cmd_idx;
+	u32 attempts;
+	u32 rearms;
+	u32 runs;
+	u16 valid_len;
+} SlippiControllerProbeState;
+
+void SlippiGetControllerProbeState(int ch, SlippiControllerProbeState *out);
+
 #endif

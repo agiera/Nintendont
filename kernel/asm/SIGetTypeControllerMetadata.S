@@ -23,8 +23,12 @@
 #    +0x230  chunk[7]   80 bytes  (raw CMD 0xA007 response)
 #    +0x290  dbg_iobuf0 u32
 #    +0x294  dbg_cmdidx u32
-#    +0x298  attempts   u32   (count of SI-work runs; hook fast-exits when >= 2)
-#    +0x29C  reserved   2 words
+#    +0x298  attempts   u32   (SI-work runs since last (re)plug; hook fast-exits when >= 2)
+#    +0x29C  last_tb_hi u32   (timebase of the previous callback on this channel)
+#    +0x2A0  last_tb_lo u32
+#    +0x2A4  rearms     u32   (times attempts was reset by a replug)
+#    +0x2A8  runs       u32   (monotonic SI-work runs since boot)
+#    +0x2AC  reserved   u32
 #
 #  Chan N base = EXTRA_DATA_BASE + 0x20 + (N * 0x2B0)
 
@@ -42,9 +46,15 @@
 .set XOFF_DBG_IOBUF0,    0x290
 .set XOFF_DBG_CMDIDX,    0x294
 .set XOFF_ATTEMPTS,      0x298    # number of SI-work runs; hook fast-exits when >= MAX_ATTEMPTS
+.set XOFF_LAST_TB_HI,    0x29C
+.set XOFF_LAST_TB_LO,    0x2A0
+.set XOFF_REARMS,        0x2A4
+.set XOFF_RUNS,          0x2A8
 .set CHUNK_SIZE,          80
 .set MAX_CHUNKS,          8
 .set MAX_ATTEMPTS,        2
+# ~0.5 s at the Wii's 60.75 MHz timebase (~0.75 s at GC 40.5 MHz).
+.set REARM_GAP_TICKS,     0x01CF7C58
 
 .set TAG_OK,              0xCA110000
 .set TAG_NODATA,          0xCA110001
@@ -75,6 +85,46 @@ SIGetTypeControllerMetadata:
     addi    r6, r6, CHAN_BASE_OFF
     add     r5, r5, r6
 
+    # Re-arm the attempt cap on a replug. The SDK retry storm fires this
+    # callback on consecutive frames, while an unplugged channel never reaches
+    # PADOriginCallback, so a quiet gap since the previous callback means a
+    # (re)plugged controller. Uses subf (not subfc) so XER[CA] is untouched.
+.Ltb_read:
+    mftbu   r7
+    mftb    r8
+    mftbu   r9
+    cmpw    r7, r9
+    bne     .Ltb_read
+
+    lwz     r10, XOFF_LAST_TB_HI(r5)
+    lwz     r11, XOFF_LAST_TB_LO(r5)
+    stw     r7, XOFF_LAST_TB_HI(r5)
+    stw     r8, XOFF_LAST_TB_LO(r5)
+
+    subf    r9, r10, r7             # d_hi = hi_now - hi_last
+    subf    r12, r11, r8            # d_lo = lo_now - lo_last (mod 2^32)
+    cmpwi   r9, 0
+    beq     .Lcmp_gap
+    cmpwi   r9, 1
+    bne     .Lrearm                 # >= 2^32 ticks apart (or timebase went back)
+    cmplw   r8, r11
+    bge     .Lrearm                 # one high word apart and lo_now >= lo_last
+.Lcmp_gap:
+    lis     r10, REARM_GAP_TICKS@h
+    ori     r10, r10, REARM_GAP_TICKS@l
+    cmplw   r12, r10
+    blt     .Lcheck_cap
+.Lrearm:
+    lwz     r9, XOFF_ATTEMPTS(r5)
+    cmpwi   r9, 0
+    beq     .Lcheck_cap
+    li      r9, 0
+    stw     r9, XOFF_ATTEMPTS(r5)
+    lwz     r9, XOFF_REARMS(r5)
+    addi    r9, r9, 1
+    stw     r9, XOFF_REARMS(r5)
+
+.Lcheck_cap:
     # Fast-exit if we've already done MAX_ATTEMPTS SI runs on this channel.
     # After two tries the SDK's retry loop will keep firing this callback as
     # the controller cycles err=-1/0, but there's no point repeatedly
@@ -296,6 +346,9 @@ SIGetTypeControllerMetadata:
     lwz     r9, XOFF_ATTEMPTS(r5)
     addi    r9, r9, 1
     stw     r9, XOFF_ATTEMPTS(r5)
+    lwz     r9, XOFF_RUNS(r5)
+    addi    r9, r9, 1
+    stw     r9, XOFF_RUNS(r5)
 
 .Lcap_exit:
     lwz     r9, XOFF_CALLS(r5)

@@ -19,6 +19,7 @@ extern char *strrchr(const char *s, int c);
 // double that, making our read buffer 10000 bytes
 #define READ_BUF_SIZE 10000
 #define THREAD_CYCLE_TIME_MS 100
+#define FTP_CATCHUP_CYCLE_TIME_MS 1
 #define THREAD_ERROR_TIME_MS 2000
 #define LED_FLASH_TIME_MS 1000
 
@@ -28,7 +29,13 @@ extern char *strrchr(const char *s, int c);
 #define SFW_EXTRA_DATA_ADDR  0x13080020
 #define SFW_XDATA_STRIDE     0x02B0
 #define SFW_XOFF_NCHUNKS     0x08
+#define SFW_XOFF_DBG_COMCSR  0x0C
 #define SFW_XOFF_CHUNKS      0x10
+#define SFW_XOFF_DBG_IOBUF0  0x290
+#define SFW_XOFF_DBG_CMDIDX  0x294
+#define SFW_XOFF_ATTEMPTS    0x298
+#define SFW_XOFF_REARMS      0x2A4
+#define SFW_XOFF_RUNS        0x2A8
 #define SFW_CHUNK_SIZE       80
 // INLNGTH=80 minus 2-byte header per chunk
 #define SFW_CHUNK_DATA        78
@@ -261,6 +268,31 @@ u16 SlippiReadControllerMetadata(int ch, u8 *dest, u16 maxLen)
 	return validateUbjsonStringDict(dest, dataLen);
 }
 
+void SlippiGetControllerProbeState(int ch, SlippiControllerProbeState *out)
+{
+	static u8 scratch[1024];
+	u32 addr;
+
+	if (!out)
+		return;
+	memset(out, 0, sizeof(*out));
+	if (ch < 0 || ch > 3)
+		return;
+
+	addr = SFW_EXTRA_DATA_ADDR + ch * SFW_XDATA_STRIDE;
+	sync_before_read((void*)addr, SFW_XDATA_STRIDE);
+	out->tag       = read32(addr + 0x00);
+	out->calls     = read32(addr + 0x04);
+	out->n_chunks  = read32(addr + SFW_XOFF_NCHUNKS);
+	out->comcsr    = read32(addr + SFW_XOFF_DBG_COMCSR);
+	out->iobuf0    = read32(addr + SFW_XOFF_DBG_IOBUF0);
+	out->cmd_idx   = (s32)read32(addr + SFW_XOFF_DBG_CMDIDX);
+	out->attempts  = read32(addr + SFW_XOFF_ATTEMPTS);
+	out->rearms    = read32(addr + SFW_XOFF_REARMS);
+	out->runs      = read32(addr + SFW_XOFF_RUNS);
+	out->valid_len = SlippiReadControllerMetadata(ch, scratch, sizeof(scratch));
+}
+
 // Build the complete Slippi footer (metadata block) into `footer`, including the
 // per-port controller metadata read from shared memory. Single source of truth so
 // the local (USB/SD) write and the streamed FTP upload emit identical footers.
@@ -387,11 +419,14 @@ static u32 SlippiHandlerThread(void *arg)
 	const bool use_usb = ConfigGetUseUSB() != 1;
 	bool ftp_enabled = (slippi_settings && ConfigGetConfig(NIN_CFG_SLIPPI_FTP) && ConfigGetConfig(NIN_CFG_NETWORK));
 	bool mounted = use_usb ? USBStorage_IsInserted_SlippiThread() : true;
+	bool ftp_backlogged = false;
 
 	while (1)
 	{
-		// Cycle time, look at const definition for more info
-		mdelay(THREAD_CYCLE_TIME_MS);
+		// Cycle time, look at const definition for more info. FTP-only catch-up uses the
+		// spectator thread's 1 ms cadence; USB writes keep 100 ms (disc-read contention).
+		mdelay(ftp_backlogged ? FTP_CATCHUP_CYCLE_TIME_MS : THREAD_CYCLE_TIME_MS);
+		ftp_backlogged = false;
 
 		bool usb_ready = true;
 		if (use_usb)
@@ -429,11 +464,16 @@ static u32 SlippiHandlerThread(void *arg)
 		}
 
 		// Read from memory and write to file or FTP
+		u64 backlog = SlippiRestoreReadPos() - memReadPos;
+		slippi_ftp_diagnostics_t* diagnostic = slippi_ftp_get_diagnostics();
+		if (backlog > diagnostic->max_backlog)
+			diagnostic->max_backlog = backlog > 0xFFFFFFFF ? 0xFFFFFFFF : (u32)backlog;
 		SlpMemError err = SlippiMemoryRead(&reader, readBuf, READ_BUF_SIZE, memReadPos);
 		if (err)
 		{
 			if (err == SLP_READ_OVERFLOW)
 			{
+				diagnostic->cancel_reason = 3;
 				memReadPos = SlippiRestoreReadPos();
 
 				// Game data was lost, so the stream can never be a valid replay.
@@ -453,6 +493,7 @@ static u32 SlippiHandlerThread(void *arg)
 
 		if (reader.lastReadResult.isNewGame)
 		{
+			slippi_ftp_reset_diagnostics();
 			gameStartTime = GetCurrentTime();
 			char *fileName = generateFileName(true);
 			hasFile = false;
@@ -525,6 +566,7 @@ static u32 SlippiHandlerThread(void *arg)
 				// server patches raw_len itself, and the post-game full-file
 				// upload remains as the fallback if the stream fails.
 				int stream_result = slippi_ftp_start_stream_upload(fileName, remote_path);
+				diagnostic->start_result = stream_result;
 				if (stream_result == SLIPPI_FTP_SUCCESS)
 				{
 					ftp_streaming_this_game = true;
@@ -532,7 +574,10 @@ static u32 SlippiHandlerThread(void *arg)
 
 					// Stream the header that would have been written to file
 					u8 header[] = {'{', 'U', 3, 'r', 'a', 'w', '[', '$', 'U', '#', 'l', 0, 0, 0, 0};
-					slippi_ftp_stream_data(header, sizeof(header));
+					if (slippi_ftp_stream_data(header, sizeof(header)) != SLIPPI_FTP_SUCCESS) {
+						slippi_ftp_cancel_stream_upload();
+						ftp_streaming_this_game = false;
+					}
 				}
 				else
 				{
@@ -588,8 +633,14 @@ static u32 SlippiHandlerThread(void *arg)
 		memReadPos += wrote;
 		writtenByteCount += wrote;
 
+		ftp_backlogged = ftp_streaming_this_game && !hasFile &&
+			SlippiRestoreReadPos() - memReadPos >= READ_BUF_SIZE;
+
 		if (reader.lastReadResult.isGameEnd) 
 		{
+			bool diagnostics_uploaded = false;
+			diagnostic->game_end_seen = 1;
+			diagnostic->local_available = hasFile;
 			dbgprintf("SlippiHandlerThread: Game end detected!\r\n");
 			if (writtenByteCount > 0) {
 				dbgprintf("SlippiHandlerThread: Completing file with %d bytes written\r\n", writtenByteCount);
@@ -603,6 +654,7 @@ static u32 SlippiHandlerThread(void *arg)
 				if (ftp_streaming_this_game && slippi_ftp_is_stream_active()) {
 					dbgprintf("SlippiFileWriter: Streaming footer to FTP (%d bytes)\r\n", writePos);
 					int footer_result = slippi_ftp_stream_data(footer, writePos);
+					diagnostic->footer_result = footer_result;
 					int stream_result = SLIPPI_FTP_UPLOAD_FAIL;
 					if (footer_result == SLIPPI_FTP_SUCCESS) {
 						// Finish the streaming upload
@@ -617,6 +669,7 @@ static u32 SlippiHandlerThread(void *arg)
 						dbgprintf("SlippiFileWriter: FTP stream upload failed to complete (%d); falling back to full-file upload\r\n", stream_result);
 						ftp_streaming_this_game = false;
 					}
+					diagnostic->finish_result = stream_result;
 				}
 				if (ConfigGetConfig(NIN_CFG_SLIPPI_REPLAYS) && (!use_usb || mounted))
 				{
@@ -644,8 +697,14 @@ static u32 SlippiHandlerThread(void *arg)
 						dbgprintf("SlippiHandlerThread: File verification failed (%d)\r\n", testResult);
 					}
 
+					if (ftp_enabled && ftp_remote_path[0] != '\0') {
+						slippi_ftp_upload_diagnostics(ftp_remote_path);
+						diagnostics_uploaded = true;
+					}
+
 					if (ftp_enabled && !ftp_streaming_this_game && ftp_remote_path[0] != '\0') {
 						int upload_result = slippi_ftp_upload_replay_file(fileName, ftp_remote_path);
+						diagnostic->fallback_result = upload_result;
 						if (upload_result == SLIPPI_FTP_SUCCESS) {
 							dbgprintf("SlippiHandlerThread: Finalized replay uploaded via FTP (%s)\r\n", ftp_remote_path);
 						} else {
@@ -653,6 +712,8 @@ static u32 SlippiHandlerThread(void *arg)
 						}
 					}
 				}
+				if (ftp_enabled && !diagnostics_uploaded && ftp_remote_path[0] != '\0')
+					slippi_ftp_upload_diagnostics(ftp_remote_path);
 				writtenByteCount = 0;
 				
 				// Flash LED to indicate completion

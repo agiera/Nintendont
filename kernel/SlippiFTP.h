@@ -50,4 +50,23 @@ int slippi_ftp_is_stream_active(void);
 // Upload a finalized replay file in one shot (preserves patched raw_len header).
 int slippi_ftp_upload_replay_file(const char* local_path, const char* remote_path);
 
+typedef struct {
+    u32 bytes_sent;
+    u32 stalls;
+    u32 max_stall_ms;
+    u32 max_backlog;
+    int last_socket_error;
+    int start_result;
+    int cancel_reason;
+    int footer_result;
+    int finish_result;
+    int fallback_result;
+    int local_available;
+    u32 game_end_seen;
+} slippi_ftp_diagnostics_t;
+
+void slippi_ftp_reset_diagnostics(void);
+slippi_ftp_diagnostics_t* slippi_ftp_get_diagnostics(void);
+int slippi_ftp_upload_diagnostics(const char* remote_path);
+
 #endif /* _SLIPPI_FTP_H_ */

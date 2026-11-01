@@ -17,6 +17,8 @@ Based on ftpii FTP implementation
 #include "alloc.h"
 #include "ff_utf8.h"
 
+extern struct recordingState gameState;
+
 #define FTP_BUFFER_SIZE 1024
 #define CRLF "\r\n"
 #define CRLF_LENGTH 2
@@ -55,6 +57,37 @@ static int ftp_initialized = 0;
 
 // Streaming upload state
 static slippi_ftp_stream_t stream_upload;
+static slippi_ftp_diagnostics_t diagnostics;
+static bool diagnostic_upload = false;
+static u32 diagnostic_timer;
+
+// TimerDiffMs reports a wrapped timer as UINT_MAX; u32 subtraction is exact across the wrap.
+static u32 elapsed_ms(u32 start) {
+	return TicksToMs(read32(HW_TIMER) - start);
+}
+
+static bool diagnostic_expired(void) {
+	return diagnostic_upload && (elapsed_ms(diagnostic_timer) >= 1500 || gameState.inGame);
+}
+
+static s32 ftp_connect_socket(s32 descriptor, struct sockaddr* address) {
+	extern s32 top_fd;
+	if (!diagnostic_upload)
+		return connect(top_fd, descriptor, address);
+	STACK_ALIGN(u32, params, 3, 32);
+	params[0] = descriptor;
+	params[1] = 4;
+	params[2] = 4;
+	if (IOS_Ioctl(top_fd, IOCTL_SO_FCNTL, params, 12, NULL, 0) < 0)
+		return -1;
+	while (!diagnostic_expired()) {
+		s32 result = connect(top_fd, descriptor, address);
+			if (result == 0 || result == -30) // -30 is IOS EISCONN: connect already completed.
+			return 0;
+		mdelay(10);
+	}
+	return -1;
+}
 static slippi_ftp_client_t stream_client;
 
 // Function prototypes for internal functions
@@ -177,7 +210,7 @@ ip_success:
 	
 	// Connect to server
 	dbgprintf("FTP: Attempting TCP connect to %d.%d.%d.%d:%d\r\n", h1, h2, h3, h4, port);
-	s32 connect_result = connect(top_fd, client->socket, (struct sockaddr*)&server_addr);
+	s32 connect_result = ftp_connect_socket(client->socket, (struct sockaddr*)&server_addr);
 	dbgprintf("FTP: Connect result: %d\r\n", connect_result);
 	if (connect_result < 0) {
 		dbgprintf("FTP: Failed to connect to server (error %d)\r\n", connect_result);
@@ -621,13 +654,13 @@ pasv_success:
 	
 	// Connect to data port
 	dbgprintf("FTP: Connecting to data port %d.%d.%d.%d:%d\r\n", h1, h2, h3, h4, data_port);
-	s32 data_connect_result = connect(top_fd, data_socket, (struct sockaddr*)&data_addr);
+	s32 data_connect_result = ftp_connect_socket(data_socket, (struct sockaddr*)&data_addr);
 	if (data_connect_result < 0) {
 		dbgprintf("FTP: Failed to connect to PASV data port (error %d), trying server IP fallback\r\n", data_connect_result);
 		u32 fallback_ip = 0;
 		if (parse_ipv4_literal(slippi_settings->ftp_server, &fallback_ip)) {
 			memcpy(&data_addr.sin_addr, &fallback_ip, sizeof(fallback_ip));
-			data_connect_result = connect(top_fd, data_socket, (struct sockaddr*)&data_addr);
+			data_connect_result = ftp_connect_socket(data_socket, (struct sockaddr*)&data_addr);
 		}
 		if (data_connect_result < 0) {
 			dbgprintf("FTP: Failed to connect to fallback data port (error %d)\r\n", data_connect_result);
@@ -637,6 +670,10 @@ pasv_success:
 		dbgprintf("FTP: Data connection established via server IP fallback\r\n");
 	}
 	dbgprintf("FTP: Data connection established\r\n");
+	{
+		u32 nodelay = 1;
+		setsockopt(top_fd, data_socket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+	}
 	
 	// Send STOR command
 	char stor_cmd[256];
@@ -729,6 +766,8 @@ static int slippi_ftp_read_response(slippi_ftp_client_t* client) {
 	dbgprintf("FTP: Starting to read response...\r\n");
 	
 	while (total_read < sizeof(client->response_buffer) - 1 && lines_read < 20) { // Allow more lines
+		if (diagnostic_expired())
+			return SLIPPI_FTP_CONNECT_FAIL;
 		char ch;
 		s32 bytes_read = recvfrom(top_fd, client->socket, &ch, 1, 0);
 		
@@ -740,6 +779,10 @@ static int slippi_ftp_read_response(slippi_ftp_client_t* client) {
 				client->connected = 0;
 				return SLIPPI_FTP_CONNECT_FAIL;
 			} else if (bytes_read < 0) {
+				if (diagnostic_upload) {
+					mdelay(10);
+					continue;
+				}
 				// Network error
 				if (consecutive_failures >= max_consecutive_failures) {
 					dbgprintf("FTP: Too many consecutive network errors (%d), assuming disconnection\r\n", consecutive_failures);
@@ -819,13 +862,15 @@ static int transfer_exact(int socket, char *buf, int length, int is_send) {
 	int result = 0;
 	int remaining = length;
 	int bytes_transferred;
-	int timeout_attempts = 0;
+	u32 progress_timer = read32(HW_TIMER);
 	// Wi-Fi stalls of several seconds are routine at a busy venue; the game
 	// data ring (SLIPMEM_SIZE) buffers minutes of play, so waiting is safe.
 	const int retry_delay_ms = 50;
-	const int max_timeout_attempts = 300; // 15 seconds of retries
+	const u32 retry_timeout_ms = 30000;
 
 	while (remaining > 0) {
+		if (diagnostic_expired())
+			return -1;
 		if (is_send) {
 			bytes_transferred = sendto(top_fd, socket, buf, remaining, 0);
 		} else {
@@ -833,20 +878,37 @@ static int transfer_exact(int socket, char *buf, int length, int is_send) {
 		}
 
 		if (bytes_transferred > 0) {
+			if (!diagnostic_upload && socket == stream_upload.data_socket) {
+				diagnostics.bytes_sent += bytes_transferred;
+				u32 stalled_ms = elapsed_ms(progress_timer);
+				if (stalled_ms > diagnostics.max_stall_ms)
+					diagnostics.max_stall_ms = stalled_ms;
+			}
 			remaining -= bytes_transferred;
 			buf += bytes_transferred;
-			timeout_attempts = 0; // Reset timeout counter on successful transfer
+			progress_timer = read32(HW_TIMER);
 		} else if (bytes_transferred == 0) {
+			if (!diagnostic_upload && socket == stream_upload.data_socket) {
+				diagnostics.last_socket_error = 0;
+				diagnostics.cancel_reason = 2;
+			}
 			// Connection closed by peer; nothing more can be sent on this socket.
 			dbgprintf("FTP: Connection closed by peer during transfer\r\n");
 			result = -1;
 			break;
 		} else {
+			if (!diagnostic_upload && socket == stream_upload.data_socket) {
+				diagnostics.stalls++;
+				diagnostics.last_socket_error = bytes_transferred;
+			}
 			// Network error - could be temporary, try again with timeout
-			timeout_attempts++;
-			if (timeout_attempts > max_timeout_attempts) {
-				dbgprintf("FTP: Transfer timeout after %d attempts (%d ms)\r\n",
-					timeout_attempts, timeout_attempts * retry_delay_ms);
+			if (elapsed_ms(progress_timer) >= retry_timeout_ms) {
+				if (!diagnostic_upload && socket == stream_upload.data_socket) {
+					diagnostics.cancel_reason = 1;
+					diagnostics.max_stall_ms = elapsed_ms(progress_timer);
+				}
+				dbgprintf("FTP: Transfer timeout after %u ms without progress\r\n",
+					elapsed_ms(progress_timer));
 				result = -1;
 				break;
 			}
@@ -903,7 +965,7 @@ static void slippi_ftp_disconnect(slippi_ftp_client_t* client) {
 	
 	if (client->socket >= 0) {
 		// Send QUIT command if still connected, but don't fail if it doesn't work
-		if (client->connected) {
+		if (client->connected && !diagnostic_upload) {
 			dbgprintf("FTP: Sending QUIT command before disconnect\r\n");
 			// Don't check result - connection might already be lost
 			slippi_ftp_send_command(client, "QUIT");
@@ -1078,6 +1140,9 @@ stream_pasv_success:
 
 stream_data_connect_success:
 	{
+		u32 nodelay = 1;
+		setsockopt(top_fd, stream_upload.data_socket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
 		// Send STOR command
 		char stor_cmd[256];
 		_sprintf(stor_cmd, "STOR %s", remote_path);
@@ -1253,5 +1318,70 @@ int slippi_ftp_upload_replay_file(const char* local_path, const char* remote_pat
 	}
 
 	slippi_ftp_disconnect(&client);
+	return result;
+}
+
+void slippi_ftp_reset_diagnostics(void) {
+	memset(&diagnostics, 0, sizeof(diagnostics));
+	diagnostics.start_result = 1;
+	diagnostics.footer_result = 1;
+	diagnostics.finish_result = 1;
+	diagnostics.fallback_result = 1;
+}
+
+slippi_ftp_diagnostics_t* slippi_ftp_get_diagnostics(void) {
+	return &diagnostics;
+}
+
+int slippi_ftp_upload_diagnostics(const char* remote_path) {
+	extern s32 top_fd;
+	// Worst case is ~1.1 KB (base fields + 4 controller ports); server caps at 2048.
+	static char payload[1536];
+	static char filename[256];
+	static slippi_ftp_client_t client;
+	SlippiControllerProbeState probe;
+	int len, ch;
+	if (!ftp_initialized || !slippi_settings || !remote_path || !*remote_path || gameState.inGame)
+		return SLIPPI_FTP_ERROR;
+	if (strlen(remote_path) + sizeof(".diag.json") > sizeof(filename))
+		return SLIPPI_FTP_ERROR;
+	_sprintf(filename, "%s.diag.json", remote_path);
+	len = _sprintf(payload,
+		"{\"version\":2,\"bytes_sent\":%u,\"stalls\":%u,\"max_stall_ms\":%u,"
+		"\"max_backlog\":%u,\"last_socket_error\":%d,\"start_result\":%d,"
+		"\"cancel_reason\":%d,\"footer_result\":%d,\"finish_result\":%d,"
+		"\"fallback_result\":%d,\"local_available\":%d,\"game_end_seen\":%u,"
+		"\"controller_ports\":[",
+		diagnostics.bytes_sent, diagnostics.stalls, diagnostics.max_stall_ms,
+		diagnostics.max_backlog, diagnostics.last_socket_error, diagnostics.start_result,
+		diagnostics.cancel_reason, diagnostics.footer_result, diagnostics.finish_result,
+		diagnostics.fallback_result, diagnostics.local_available, diagnostics.game_end_seen);
+	for (ch = 0; ch < 4; ch++) {
+		SlippiGetControllerProbeState(ch, &probe);
+		len += _sprintf(payload + len,
+			"%s{\"tag\":\"%08x\",\"calls\":%u,\"attempts\":%u,\"rearms\":%u,\"runs\":%u,"
+			"\"n_chunks\":%u,\"comcsr\":\"%08x\",\"iobuf0\":\"%08x\",\"cmd_idx\":%d,"
+			"\"valid_len\":%u}",
+			ch ? "," : "", probe.tag, probe.calls, probe.attempts, probe.rearms, probe.runs,
+			probe.n_chunks, probe.comcsr, probe.iobuf0, probe.cmd_idx, probe.valid_len);
+	}
+	payload[len++] = ']';
+	payload[len++] = '}';
+	payload[len] = '\0';
+	// dbgprintf renders into a 256-byte stack buffer, so never pass it the payload.
+	dbgprintf("FTP Diagnostics: %d bytes\r\n", len);
+	memset(&client, 0, sizeof(client));
+	client.socket = -1;
+	diagnostic_timer = read32(HW_TIMER);
+	diagnostic_upload = true;
+	int result = slippi_ftp_connect(&client, slippi_settings->ftp_server, slippi_settings->ftp_port);
+	if (result == SLIPPI_FTP_SUCCESS)
+		result = slippi_ftp_authenticate(&client, slippi_settings->ftp_username, slippi_settings->ftp_password);
+	if (result == SLIPPI_FTP_SUCCESS)
+		result = slippi_ftp_upload_file(&client, NULL, (const u8*)payload, strlen(payload), filename);
+	if (client.socket >= 0)
+		close(top_fd, client.socket);
+	diagnostic_upload = false;
+	dbgprintf("FTP Diagnostics: delivery result=%d elapsed_ms=%u\r\n", result, elapsed_ms(diagnostic_timer));
 	return result;
 }
