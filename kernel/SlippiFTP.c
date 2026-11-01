@@ -88,6 +88,23 @@ static s32 ftp_connect_socket(s32 descriptor, struct sockaddr* address) {
 	}
 	return -1;
 }
+
+// IOS RSTs a non-blocking socket closed with unacked data, and the server then drops the upload.
+static void ftp_finish_nonblocking_data(s32 data_socket) {
+	extern s32 top_fd;
+	STACK_ALIGN(u32, params, 2, 32);
+	STACK_ALIGN(u8, scratch, 32, 32);
+	params[0] = data_socket;
+	params[1] = 1; // SHUT_WR
+	if (IOS_Ioctl(top_fd, IOCTL_SO_SHUTDOWN, params, 8, NULL, 0) < 0)
+		return;
+	while (!diagnostic_expired()) {
+		s32 result = recvfrom(top_fd, data_socket, scratch, 32, 0);
+		if (result == 0 || (result < 0 && result != -6)) // -6 is IOS EAGAIN.
+			return;
+		mdelay(10);
+	}
+}
 static slippi_ftp_client_t stream_client;
 
 // Function prototypes for internal functions
@@ -713,6 +730,8 @@ pasv_success:
 	
 	// Close data connection
 	dbgprintf("FTP: Closing data connection\r\n");
+	if (diagnostic_upload && file_result >= 0)
+		ftp_finish_nonblocking_data(data_socket);
 	close(top_fd, data_socket);
 	
 	if (file_result < 0) {
