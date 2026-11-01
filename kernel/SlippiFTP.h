@@ -56,6 +56,12 @@ typedef struct {
     u32 raises;
     int raise_result;
     u32 mss_after_raise;
+    u32 sndbuf_start;
+    int sndbuf_set_result;
+    u32 sndbuf_after;
+    u32 send_calls;
+    u32 send_partial;
+    u32 send_ticks;
 } slippi_ftp_tcp_diagnostics_t;
 
 typedef struct {

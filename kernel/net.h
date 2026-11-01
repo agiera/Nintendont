@@ -15,6 +15,9 @@
 #define TCP_NODELAY  0x2001	   /* don't delay send to coalesce packets */
 #define TCP_MAXSEG   0x2002        /* IOS allows raising it on a connected socket */
 
+#define SOL_SOCKET   0xFFFF
+#define SO_SNDBUF    0x1001
+
 /* From marcan - see git://git.bootmii.org/var/git/mini.git
  * Looks like this is also used in libogc code */
 
