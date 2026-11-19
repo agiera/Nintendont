@@ -5,6 +5,7 @@ Based on ftpii FTP implementation
 */
 
 #include "SlippiFTP.h"
+#include "SlippiCompress.h"
 #include "SlippiFileWriter.h"
 #include "Config.h"
 #include "SlippiMemory.h"
@@ -67,7 +68,8 @@ static u32 elapsed_ms(u32 start) {
 }
 
 static bool diagnostic_expired(void) {
-	return diagnostic_upload && (elapsed_ms(diagnostic_timer) >= 1500 || gameState.inGame);
+	// Login + PASV + STOR is ~8 round trips; venue Wi-Fi RTT reaches 250-400 ms.
+	return diagnostic_upload && (elapsed_ms(diagnostic_timer) >= 5000 || gameState.inGame);
 }
 
 static u32 mss_check_timer;
@@ -147,6 +149,10 @@ static int send_from_file(int data_socket, const char* filepath);
 static int send_from_buffer(int data_socket, const u8* buf, u32 len);
 static int slippi_ftp_upload_stream_metadata_sidecar(slippi_ftp_client_t* client, const char* remote_replay_path);
 static int build_stream_metadata_json(char* out, u16 outCap);
+
+static int stream_sink(const u8* data, u32 len) {
+	return transfer_exact(stream_upload.data_socket, (char*)data, len, 1) < 0 ? -1 : 0;
+}
 
 // Initialize FTP client system
 int slippi_ftp_init(void) {
@@ -1193,9 +1199,9 @@ stream_data_connect_success:
 		diagnostics.tcp.mss_start = tcp_read_mss(stream_upload.data_socket);
 		mss_check_timer = read32(HW_TIMER);
 
-		// Send STOR command
+		// Send STOR command; the server decodes .slpz back to .slp as it arrives.
 		char stor_cmd[256];
-		_sprintf(stor_cmd, "STOR %s", remote_path);
+		_sprintf(stor_cmd, "STOR %sz", remote_path);
 		
 		send_result = slippi_ftp_send_command(&stream_client, stor_cmd);
 		if (send_result != SLIPPI_FTP_SUCCESS) {
@@ -1225,6 +1231,7 @@ stream_data_connect_success:
 	}
 	
 	// Initialize stream state
+	slpz_reset();
 	stream_upload.active = 1;
 	stream_upload.bytes_uploaded = 0;
 	stream_upload.client = &stream_client;
@@ -1241,7 +1248,7 @@ int slippi_ftp_stream_data(const void* data, u32 size) {
 		return SLIPPI_FTP_ERROR;
 	}
 	
-	int result = transfer_exact(stream_upload.data_socket, (char*)data, size, 1);
+	int result = slpz_write((const u8*)data, size, stream_sink);
 	if (result < 0) {
 		dbgprintf("FTP Stream: Failed to send data chunk (%d bytes), marking stream as inactive\r\n", size);
 		// Mark stream as inactive but don't clean up yet - let finish/cancel handle cleanup
@@ -1266,6 +1273,9 @@ int slippi_ftp_finish_stream_upload(void) {
 	
 	// Close data connection
 	if (stream_upload.data_socket >= 0) {
+		// Every write was sync-flushed, so a failure here loses no replay data.
+		if (stream_upload.active)
+			slpz_finish(stream_sink);
 		close(top_fd, stream_upload.data_socket);
 		stream_upload.data_socket = -1;
 	}
